@@ -40,29 +40,24 @@ class BiTemperedLoss(base_layer.BaseLayer):
   are set to (t1, t2) throughout.
 
   Source: https://bit.ly/3jSol8T
+
+  Attributes:
+    t1: Temperature 1 (log).
+    t2: Temperature 2 (exp).
+    label_smoothing: Label smoothing.
+    start_step: Step number to start transitioning from CE loss.
+    end_step: Step number to reach the final temperature pairs (t1, t2). When
+      end_step == 0, the temperatures are set to (t1, t2) throughout.
   """
-
-  class HParams(base_layer.BaseLayer.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      t1: Temperature 1 (log).
-      t2: Temperature 2 (exp).
-      label_smoothing: Label smoothing.
-      start_step: Step number to start transitioning from CE loss.
-      end_step: Step number to reach the final temperature pairs (t1, t2). When
-        end_step == 0, the temperatures are set to (t1, t2) throughout.
-    """
-    t1: float = 1.0
-    t2: float = 1.0
-    label_smoothing: float = 0.0
-    start_step: int = 0
-    end_step: int = 0
+  t1: float = 1.0
+  t2: float = 1.0
+  label_smoothing: float = 0.0
+  start_step: int = 0
+  end_step: int = 0
 
   def setup(self) -> None:
     """Initialize the step variable."""
-    p = self.hparams
-    assert p.end_step >= p.start_step
+    assert self.end_step >= self.start_step
     count = WeightHParams(
         shape=[],
         init=WeightInit.Constant(0.0),
@@ -81,15 +76,20 @@ class BiTemperedLoss(base_layer.BaseLayer):
     Returns:
       Base schedule.
     """
-    p = self.hparams
     count = jnp.array(count).astype(jnp.float32)
     schedule = jnp.where(
-        jnp.logical_and(p.end_step > 0, count < p.end_step), 1.0, 0.0)
+        jnp.logical_and(self.end_step > 0, count < self.end_step), 1.0, 0.0
+    )
     schedule = jnp.where(
-        count >= p.start_step,
+        count >= self.start_step,
         jnp.maximum(
-            1. - (count - p.start_step) /
-            jnp.maximum(p.end_step - p.start_step, 1.0), 0.0), schedule)
+            1.0
+            - (count - self.start_step)
+            / jnp.maximum(self.end_step - self.start_step, 1.0),
+            0.0,
+        ),
+        schedule,
+    )
     return schedule
 
   def __call__(self, logits: JTensor, labels: JTensor) -> JTensor:
@@ -103,14 +103,14 @@ class BiTemperedLoss(base_layer.BaseLayer):
       Loss values. Shaped either [...] or same as logits/labels but without the
       last dimension of size `num_classes`.
     """
-    p = self.hparams
     base_schedule = 0.0
     if not self.do_eval:
       count = self.get_var('count')
       self.update_var('count', count + 1.0)
       base_schedule = self.temperature_schedule(count)
-    t1 = 1.0 * base_schedule + p.t1 * (1.0 - base_schedule)
-    t2 = 1.0 * base_schedule + p.t2 * (1.0 - base_schedule)
+    t1 = 1.0 * base_schedule + self.t1 * (1.0 - base_schedule)
+    t2 = 1.0 * base_schedule + self.t2 * (1.0 - base_schedule)
     loss_vals = loss.bi_tempered_logistic_loss(
-        logits, labels, t1, t2, label_smoothing=p.label_smoothing)
+        logits, labels, t1, t2, label_smoothing=self.label_smoothing
+    )
     return loss_vals

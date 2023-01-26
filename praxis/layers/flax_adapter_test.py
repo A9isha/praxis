@@ -16,6 +16,7 @@
 """Tests for Flax adapter."""
 
 from typing import Any, Tuple
+from praxis import pax_fiddle
 
 from absl.testing import absltest
 import fiddle as fdl
@@ -61,33 +62,31 @@ class CNN(flax_nn.Module):
 
 
 class MixLayer(base_layer.BaseLayer):
-  """A layer that mixes Pax native layer with nn.Module wrapper layer."""
+  """A layer that mixes Pax native layer with nn.Module wrapper layer.
 
-  class HParams(base_layer.BaseLayer.HParams):
-    """Associated hyperparams for this layer class.
-
-    Attributes:
-    use_running_average: bool as if BN layers are using running average or not.
-    """
-    use_running_average: bool = False
+  Attributes:
+  use_running_average: bool as if BN layers are using running average or not.
+  """
+  use_running_average: bool = False
 
   def setup(self) -> None:
     super().setup()
 
-    cnn_p = flax_adapter.FlaxModuleAdapter.HParams(module_factory_method=CNN)
+    cnn_p = pax_fiddle.Config(
+        flax_adapter.FlaxModuleAdapter, module_factory_method=CNN
+    )
 
     self.create_child('cnn_p1', cnn_p.clone())
     self.create_child('cnn_p2', cnn_p.clone())
-    bn_p = normalizations.BatchNorm.HParams(dim=10)
+    bn_p = pax_fiddle.Config(normalizations.BatchNorm, dim=10)
     self.create_child('bn', bn_p)
 
   def __call__(self, x: JTensor) -> Tuple[JTensor, JTensor, JTensor]:
-    p = self.hparams
     # Call cnn_p1 twice to verify this doesn't break initialization.
-    out1 = (
-        self.cnn_p1(x, use_running_average=p.use_running_average) +
-        self.cnn_p1(x / 2., use_running_average=p.use_running_average))
-    out2 = self.cnn_p2(x, use_running_average=p.use_running_average)
+    out1 = self.cnn_p1(
+        x, use_running_average=self.use_running_average
+    ) + self.cnn_p1(x / 2.0, use_running_average=self.use_running_average)
+    out2 = self.cnn_p2(x, use_running_average=self.use_running_average)
     out = self.bn(out1 + out2)
     return out1, out2, out
 
@@ -99,7 +98,7 @@ class FlaxWrapperTest(test_utils.TestCase):
     np.random.seed(123456)
 
   def test_mix_layer(self):
-    test_layer_p = MixLayer.HParams(name='test_layer')
+    test_layer_p = pax_fiddle.Config(MixLayer, name='test_layer')
     test_layer = instantiate(test_layer_p)
 
     prng_key = jax.random.PRNGKey(seed=123)
@@ -192,7 +191,7 @@ class PaxWrapperTest(test_utils.TestCase):
     np.random.seed(123456)
 
   def test_wrap_pax_params(self):
-    bn_p = normalizations.BatchNorm.HParams(name='pax_bn', dim=3)
+    bn_p = pax_fiddle.Config(normalizations.BatchNorm, name='pax_bn', dim=3)
 
     class SomeFlaxModel(flax_nn.Module):
       bn_p: Any
@@ -215,7 +214,7 @@ class PaxWrapperTest(test_utils.TestCase):
       self.assertAllClose(wrapped_layer_res, pax_layer_res)
 
   def test_wrap_pax_layer_then_adapter(self):
-    bn_p = normalizations.BatchNorm.HParams(name='pax_bn', dim=5)
+    bn_p = pax_fiddle.Config(normalizations.BatchNorm, name='pax_bn', dim=5)
 
     # The flax module contains praxis layers.
     # But it is also adapted into a praxis layer.
@@ -228,8 +227,11 @@ class PaxWrapperTest(test_utils.TestCase):
         x = self.bn_p.Instantiate()(x)
         return x
 
-    test_layer_p = flax_adapter.FlaxModuleAdapter.HParams(
-        module_factory_method=lambda: SomeFlaxModel(bn_p), name='test_layer')
+    test_layer_p = pax_fiddle.Config(
+        flax_adapter.FlaxModuleAdapter,
+        module_factory_method=lambda: SomeFlaxModel(bn_p),
+        name='test_layer',
+    )
     test_layer = instantiate(test_layer_p)
     inputs = jnp.zeros((5, 5))
     with base_layer.JaxContext.new_context():
@@ -242,7 +244,7 @@ class PaxWrapperTest(test_utils.TestCase):
       test_layer.apply(init_vars, inputs)
 
   def test_wrap_pax_layer(self):
-    bn_p = normalizations.BatchNorm.HParams(name='pax_bn', dim=3)
+    bn_p = pax_fiddle.Config(normalizations.BatchNorm, name='pax_bn', dim=3)
     pax_layer = bn_p.Instantiate()
 
     class SomeFlaxModel(flax_nn.Module):

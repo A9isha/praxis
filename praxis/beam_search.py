@@ -15,7 +15,7 @@
 
 """Vanilla Beam search algorithm."""
 
-from typing import Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 from flax import linen as nn
 import jax
@@ -97,12 +97,17 @@ def broadcast_beam_dim(x: JTensor, beam_dim: int, beam_size: int) -> JTensor:
 
 
 # TODO(b/249483164): Rename BaseLayerApi->BaseLayer after Fiddle migration.
-def beam_search(model: base_layer.BaseLayerApi,
-                extend_step_fn: decoder_utils.ExtendStepFn,
-                fprop_fn: decoder_utils.FPropFn,
-                transform_state_fn: decoder_utils.TransformStateFn,
-                target_prefix_ids: JTensor, target_prefix_paddings: JTensor,
-                beam_search_hparams: BeamSearchHParams) -> NestedMap:
+def beam_search(
+    model: base_layer.BaseLayerApi,
+    extend_step_fn: decoder_utils.ExtendStepFn,
+    fprop_fn: decoder_utils.FPropFn,
+    transform_state_fn: decoder_utils.TransformStateFn,
+    target_prefix_ids: JTensor,
+    target_prefix_paddings: JTensor,
+    beam_search_hparams: BeamSearchHParams,
+    decode_loop_mesh_axes_transpose: Optional[Dict[str, str]] = None,
+    model_var_pspecs: Optional[base_layer.NestedPartitionSpec] = None,
+) -> NestedMap:
   """Vanilla beam search decode the input batch.
 
   Args:
@@ -119,33 +124,74 @@ def beam_search(model: base_layer.BaseLayerApi,
     target_prefix_paddings: The token paddings that correspond to the target
       sequence, with shape [batch_size, prefix_sequence_length].
     beam_search_hparams: Beam search hyper parameters.
+    decode_loop_mesh_axes_transpose: Optional mesh transpose for decoding loop.
+    model_var_pspecs: needed if decode_loop_mesh_axes_transpose is provided.
 
   Returns:
     A NestedMap with `.decode_lengths` (vector of ints indicating the lengths
-    of non-padding tokens in `.output_ids`, which includes the prefix)`,
+    of non-padding tokens in `.output_ids`, which includes the prefix),
     `.output_ids` (matrix of int ids with the
-    decoded output), `.scores` (Scores of decoding sequence).
+    decoded output), `.scores` (Scores of decoding sequence), `.log_probs`
+    (matrix of floats indicating log probabilities for each output),
+    `prefix_lengths` (vector of ints for prefix length),
+    `prefix_ids` (matrix of ints for prefix ids).
   """
+
+  # Init decode state using fprop_fn, state seq size is max_prefix_len.
+  fprop_fn(model, target_prefix_ids, target_prefix_paddings)
+  model = decoder_utils.maybe_reshard_mdl_for_decode(
+      model,
+      decode_loop_mesh_axes_transpose,
+      model_var_pspecs,
+      transform_state_fn,
+  )
+  with decoder_utils.maybe_decode_mesh_transpose(
+      model, decode_loop_mesh_axes_transpose
+  ):
+    return beam_search_after_prefix_fprop(
+        model,
+        extend_step_fn,
+        transform_state_fn,
+        target_prefix_ids,
+        target_prefix_paddings,
+        beam_search_hparams,
+    )
+
+
+# TODO(b/249483164): Rename BaseLayerApi->BaseLayer after Fiddle migration.
+def beam_search_after_prefix_fprop(
+    model: base_layer.BaseLayerApi,
+    extend_step_fn: decoder_utils.ExtendStepFn,
+    transform_state_fn: decoder_utils.TransformStateFn,
+    target_prefix_ids: JTensor,
+    target_prefix_paddings: JTensor,
+    beam_search_hparams: BeamSearchHParams,
+) -> NestedMap:
+  """Same as beam_search but this is after prefix fprop."""
   # TODO(b/229679837): Move right align prefix ids and paddings logic inside
   # the beam_search function.
 
   # max_decode_steps doesn't count the prefix part.
   assert beam_search_hparams.max_decode_steps is not None
+  max_decode_steps = beam_search_hparams.max_decode_steps
+  max_decode_steps = (
+      [max_decode_steps]
+      if isinstance(max_decode_steps, int)
+      else max_decode_steps
+  )
+  max_decode_steps = sorted(max_decode_steps)
   beam_dim = 1
   beam_size = beam_search_hparams.beam_size
   batch_size = target_prefix_ids.shape[0]
   max_prefix_len = target_prefix_ids.shape[1]
-  terminal_ids = beam_search_hparams.parse_tokens or [
+  terminal_ids = (
       beam_search_hparams.eos_id
-  ]
-  seq_len = beam_search_hparams.max_decode_steps + max_prefix_len
-
-  # Init decode state using fprop_fn, state seq size is max_prefix_len.
-  fprop_fn(model, target_prefix_ids, target_prefix_paddings)
-
+      if isinstance(beam_search_hparams.eos_id, Sequence)
+      else [beam_search_hparams.eos_id]
+  )
+  seq_len = max(max_decode_steps) + max_prefix_len
   # Pad max_decode_steps to the state.
-  transform_state_fn(
-      model, decoder_utils.pad_state_fn(beam_search_hparams.max_decode_steps))
+  transform_state_fn(model, decoder_utils.pad_state_fn(min(max_decode_steps)))
 
   # Broadcast cache states before the while loop.
   def _broadcast_state_fn(x, batch_dim, time_dim):
@@ -187,10 +233,15 @@ def beam_search(model: base_layer.BaseLayerApi,
   val.segment_pos = jnp.reshape(prefix_lengths - 1, (batch_size * beam_size,))
   val.end_decode_lengths = jnp.ones_like(prefix_lengths) * seq_len
 
-  def cond_func(model, val):
-    """Whether the while loop should continue."""
-    del model
-    return val.step < seq_len - 1
+  def get_cond_func(stop_decode_steps):
+    """Get condition function for given stop decode steps."""
+
+    def cond_func(model, val):
+      """Whether the while loop should continue."""
+      del model
+      return val.step < min(seq_len - 1, max_prefix_len + stop_decode_steps - 1)
+
+    return cond_func
 
   def loop_body(model, val):
     """From ids at `step`, update output ids at `step + 1`."""
@@ -260,12 +311,22 @@ def beam_search(model: base_layer.BaseLayerApi,
     return val
 
   # Beam search loop. Cache state is broacasted before the while loop.
-  result = nn.while_loop(
-      cond_func,
-      loop_body,
-      model,
-      val,
-      carry_variables=[base_layer.DECODE_CACHE])
+  for i in range(len(max_decode_steps)):
+    if i > 0:
+      pad_size = max_decode_steps[i] - max_decode_steps[i - 1]
+      transform_state_fn(model, decoder_utils.pad_state_fn(pad_size))
+    result = nn.while_loop(
+        get_cond_func(max_decode_steps[i]),
+        loop_body,
+        model,
+        val,
+        carry_variables=[base_layer.DECODE_CACHE],
+    )
+
+  prefix_ids = decoder_utils.left_align_tensor(target_prefix_ids[:, 0, :],
+                                               prefix_lengths[:, 0],
+                                               max_prefix_len)
+  prefix_ids = jnp.expand_dims(prefix_ids, 1)
 
   result.output_ids = result.end_ids
   result.output_ids = decoder_utils.left_align_tensor(
@@ -282,6 +343,7 @@ def beam_search(model: base_layer.BaseLayerApi,
   result.decode_lengths = result.end_decode_lengths
   result.original_lengths = prefix_lengths
   result.prefix_lengths = prefix_lengths
+  result.prefix_ids = prefix_ids
   del (result.end_ids, result.end_scores, result.end_decode_lengths,
        result.end_scores_norm, result.hyp_scores)
   return result

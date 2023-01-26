@@ -20,6 +20,7 @@ from typing import Tuple
 from jax import numpy as jnp
 from praxis import base_layer
 from praxis import base_model
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
 from praxis.layers import linears
@@ -28,30 +29,27 @@ from praxis.layers import transformers
 
 NestedMap = py_utils.NestedMap
 JTensor = pytypes.JTensor
-
-BaseHParams = base_layer.BaseLayer.HParams
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 sub_config_field = base_layer.sub_config_field
+template_field = base_layer.template_field
 
 
 class ProjectionLayer(base_layer.BaseLayer):
-  """A simple projection layer."""
+  """A simple projection layer.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      input_dims: Depth of the input.
-      output_dims: Depth of the output.
-    """
-    input_dims: int = 0
-    output_dims: int = 0
+  Attributes:
+    input_dims: Depth of the input.
+    output_dims: Depth of the output.
+  """
+  input_dims: int = 0
+  output_dims: int = 0
 
   def setup(self) -> None:
-    p = self.hparams
-    linear_layer_p = linears.Linear.HParams(
-        input_dims=p.input_dims, output_dims=p.output_dims)
+    linear_layer_p = pax_fiddle.Config(
+        linears.Linear, input_dims=self.input_dims, output_dims=self.output_dims
+    )
     self.create_child('linear', linear_layer_p)
-    bias_layer_p = linears.Bias.HParams(dims=p.output_dims)
+    bias_layer_p = pax_fiddle.Config(linears.Bias, dims=self.output_dims)
     self.create_child('bias', bias_layer_p)
 
   def __call__(self, inputs: JTensor) -> JTensor:
@@ -69,13 +67,17 @@ class TestLayer(base_layer.BaseLayer):
   """A test layer which is a composite of multiple layers."""
 
   def setup(self) -> None:
-    linear_layer_p01 = linears.Linear.HParams(input_dims=2, output_dims=3)
-    linear_layer_p02 = linears.Linear.HParams(input_dims=3, output_dims=4)
+    linear_layer_p01 = pax_fiddle.Config(
+        linears.Linear, input_dims=2, output_dims=3
+    )
+    linear_layer_p02 = pax_fiddle.Config(
+        linears.Linear, input_dims=3, output_dims=4
+    )
     self.create_children('linear', [linear_layer_p01, linear_layer_p02])
-    bias_layer_p01 = linears.Bias.HParams(dims=3)
-    bias_layer_p02 = linears.Bias.HParams(dims=4)
+    bias_layer_p01 = pax_fiddle.Config(linears.Bias, dims=3)
+    bias_layer_p02 = pax_fiddle.Config(linears.Bias, dims=4)
     self.create_children('bias', [bias_layer_p01, bias_layer_p02])
-    add_one_layer_p = AddOneLayer.HParams()
+    add_one_layer_p = pax_fiddle.Config(AddOneLayer)
     self.create_child('add_one', add_one_layer_p)
 
     self.create_variable('final_proj', base_layer.WeightHParams(shape=[4, 5]))
@@ -91,25 +93,25 @@ class TestLayer(base_layer.BaseLayer):
 
 
 class VarUnusedLayer(base_layer.BaseLayer):
-  """A test where some of the vars are not used in fprop."""
+  """A test where some of the vars are not used in fprop.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      input_dims: Depth of the input.
-      output_dims: Depth of the output.
-    """
-    input_dims: int = 0
-    output_dims: int = 0
+  Attributes:
+    input_dims: Depth of the input.
+    output_dims: Depth of the output.
+  """
+  input_dims: int = 0
+  output_dims: int = 0
 
   def setup(self) -> None:
-    p = self.hparams
     self.create_variable(
-        'var01', base_layer.WeightHParams(shape=[p.input_dims, p.output_dims]))
+        'var01',
+        base_layer.WeightHParams(shape=[self.input_dims, self.output_dims]),
+    )
     # var02 is not used.
     self.create_variable(
-        'var02', base_layer.WeightHParams(shape=[p.input_dims, p.output_dims]))
+        'var02',
+        base_layer.WeightHParams(shape=[self.input_dims, self.output_dims]),
+    )
 
   def __call__(self, inputs: JTensor) -> JTensor:
     out = jnp.einsum('bi,io->bo', inputs, self.theta.var01)
@@ -118,28 +120,30 @@ class VarUnusedLayer(base_layer.BaseLayer):
 
 
 class TestModel01(base_model.BaseModel):
-  """Simple model for testing."""
+  """Simple model for testing.
 
-  class HParams(base_model.BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      input_dims: Depth of the input.
-      output_dims: Depth of the output.
-    """
-    input_dims: int = 0
-    output_dims: int = 0
+  Attributes:
+    input_dims: Depth of the input.
+    output_dims: Depth of the output.
+  """
+  input_dims: int = 0
+  output_dims: int = 0
 
   def setup(self) -> None:
-    p = self.hparams
-    bn_params = normalizations.BatchNorm.HParams(name='bn', dim=p.input_dims)
+    bn_params = pax_fiddle.Config(
+        normalizations.BatchNorm, name='bn', dim=self.input_dims
+    )
     self.create_child('bn', bn_params)
 
     self.create_variable(
-        'var01', base_layer.WeightHParams(shape=[p.input_dims, p.output_dims]))
+        'var01',
+        base_layer.WeightHParams(shape=[self.input_dims, self.output_dims]),
+    )
     # var02 is not used.
     self.create_variable(
-        'var02', base_layer.WeightHParams(shape=[p.input_dims, p.output_dims]))
+        'var02',
+        base_layer.WeightHParams(shape=[self.input_dims, self.output_dims]),
+    )
 
   def compute_predictions(self, input_batch: NestedMap) -> JTensor:
     in_normed = self.bn(input_batch.inputs)
@@ -159,25 +163,21 @@ class TestModel01(base_model.BaseModel):
 
 
 class TestLinearRegressionModel(base_model.BaseModel):
-  """Linear regression model."""
+  """Linear regression model.
 
-  class HParams(base_model.BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      input_dims: Depth of the input.
-      output_dims: Depth of the output.
-      linear_p: Params for the linear layer.
-    """
-    input_dims: int = 0
-    output_dims: int = 0
-    linear_p: BaseHParams = sub_config_field(linears.Linear.HParams)
+  Attributes:
+    input_dims: Depth of the input.
+    output_dims: Depth of the output.
+    linear_p: Params for the linear layer.
+  """
+  input_dims: int = 0
+  output_dims: int = 0
+  linear_p: LayerTpl = template_field(linears.Linear)
 
   def setup(self) -> None:
-    p = self.hparams
-    params = p.linear_p.clone()
-    params.input_dims = p.input_dims
-    params.output_dims = p.output_dims
+    params = self.linear_p.clone()
+    params.input_dims = self.input_dims
+    params.output_dims = self.output_dims
     self.create_child('linear', params)
 
   def compute_predictions(self, input_batch: NestedMap) -> JTensor:
@@ -192,19 +192,17 @@ class TestLinearRegressionModel(base_model.BaseModel):
 
 
 class TestBatchNormalizationModel(base_model.BaseModel):
-  """Test batch normalization correctness using a regression task."""
+  """Test batch normalization correctness using a regression task.
 
-  class HParams(base_model.BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      input_dims: Depth of the input.
-    """
-    input_dims: int = 0
+  Attributes:
+    input_dims: Depth of the input.
+  """
+  input_dims: int = 0
 
   def setup(self):
-    p = self.hparams
-    bn_params = normalizations.BatchNorm.HParams(name='bn', dim=p.input_dims)
+    bn_params = pax_fiddle.Config(
+        normalizations.BatchNorm, name='bn', dim=self.input_dims
+    )
     self.create_child('bn', bn_params)
 
   def compute_predictions(self, input_batch: NestedMap) -> JTensor:
@@ -223,20 +221,15 @@ class TestBatchNormalizationModel(base_model.BaseModel):
 
 
 class TestSpmdModel(base_model.BaseModel):
-  """A simple spmd model for testing purposes."""
+  """A simple spmd model for testing purposes.
 
-  class HParams(base_model.BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      xformer_ffw: Parameterization of the feedforward layer.
-    """
-    xformer_ffw: BaseHParams = sub_config_field(
-        transformers.TransformerFeedForward.HParams)
+  Attributes:
+    xformer_ffw: Parameterization of the feedforward layer.
+  """
+  xformer_ffw: LayerTpl = template_field(transformers.TransformerFeedForward)
 
   def setup(self):
-    p = self.hparams
-    self.create_child('ffwd', p.xformer_ffw)
+    self.create_child('ffwd', self.xformer_ffw)
 
   def compute_predictions(self, input_batch: NestedMap) -> JTensor:
     return self.ffwd(input_batch.inputs)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import abc
 import copy
+import math
 import re
 from typing import Dict, Optional, Sequence
 
@@ -26,8 +27,6 @@ from absl import logging
 import jax
 from jax._src.lib import xla_client as xc
 from jax.experimental import maps
-from lingvo.core import cluster_factory
-from lingvo.core import datasource
 import numpy as np
 from praxis import base_hyperparams
 from praxis import py_utils
@@ -118,7 +117,15 @@ class BaseInput(base_hyperparams.BaseParameterizable):
     assert hparams.batch_size is not None
     return hparams.batch_size
 
+  @classmethod
+  def get_global_batch_size(cls, hparams: BaseInput.HParams) -> int:
+    assert hparams.num_infeed_hosts is not None
+    return cls.get_batch_size(hparams) * hparams.num_infeed_hosts
+
   def __init__(self, hparams: BaseInput.HParams) -> None:
+    # Ensure hparams are not mutated.
+    hparams = hparams.clone()
+
     if self._VALIDATE_BATCH_SIZE_NOT_NONE and (hparams.batch_size is None):
       raise ValueError('Must specify p.batch_size.')
     if not hparams.name:
@@ -319,7 +326,7 @@ class LingvoInputAdaptor(BaseInput):
           'suppress this error by setting hparams.allow_fixed_file_random_seed '
           '= True.')
     super().__init__(hparams)
-    self._cluster = copy.deepcopy(cluster_factory.Current())
+    self._cluster = copy.deepcopy(py_utils.current_cluster())
     # For Lingvo's Cluster context that may impact the behavior of this input
     # generator, we always set use_tpu to True, and optionally set do_eval
     # for non-training data when configured to do so. All other Cluster params
@@ -350,7 +357,8 @@ class LingvoInputAdaptor(BaseInput):
       self.input = p.input.Instantiate()
 
     if hasattr(self.input, 'datasource') and isinstance(
-        self.input.datasource, datasource.TFDatasetSource):
+        self.input.datasource, py_utils.TFDatasetSource
+    ):
       # For the special case when the input is implemented by a tf.data.Dataset,
       # call eagerly. Using tf.function may result in returning duplicate
       # batches.
@@ -385,7 +393,8 @@ class LingvoInputAdaptor(BaseInput):
 
   def reset(self) -> None:
     if hasattr(self.input, 'datasource') and isinstance(
-        self.input.datasource, datasource.TFDatasetSource):
+        self.input.datasource, py_utils.TFDatasetSource
+    ):
       self.input.datasource.Reset()
       # reset counter to 0.
       self._num_batches_produced = 0
@@ -638,6 +647,24 @@ class LingvoLazyEvalAdaptor(LingvoInputAdaptor):
       num_samples += num_samples_remainder
     self._num_samples = num_samples
     self.num_batches = num_batches
+    if hparams.num_batches is not None:
+      if hparams.num_batches <= 0:
+        logging.warning(
+            '`num_batches` is non-positive (i.e. %d) so ignored',
+            hparams.num_batches,
+        )
+      elif hparams.num_batches > num_batches:
+        logging.warning(
+            '`num_batches` is greater than dataset capacity (%d>%d) so ignored',
+            hparams.num_batches,
+            num_batches,
+        )
+      else:
+        self.num_batches = hparams.num_batches
+        logging.warning(
+            '`num_batches` overridden to %d as requested by hparams',
+            hparams.num_batches,
+        )
     self.reset()
 
   def _update_file_random_seed(self) -> None:
@@ -681,14 +708,14 @@ class LingvoLazyEvalAdaptor(LingvoInputAdaptor):
     # belong to other hosts.
     if remaining_samples > 0:
       for _ in range(self.hparams.num_infeed_hosts - 1):
-        super().get_next()
+        self._get_next_fn()
     return ret
 
   def reset(self):
     super().reset()
     # Skips k batches which belong to other hosts.
     for _ in range(self.hparams.infeed_host_index):
-      super().get_next()
+      self._get_next_fn()
     self._num_examples_emitted = 0
     self._num_batches_emitted = 0
 
@@ -701,7 +728,15 @@ class MultiInput(BaseInput):
   iteratively called for each child in eager mode to generate one batch of
   data for each step. Each batch will contain a batch from all children
   input generators nested into a NestedMap.
+
+  Since Pax trainers with model sharding assume a global batch size for all
+  input tensors, we reshape all tensors across different inputs to
+  [global_batch_size, inner_input_batch_size, ...]. global_batch_size is
+  automatically determined from children input generator batch sizes.
+
+  The model code is responsible for collapsing the two batch_size dimensions.
   """
+
   _VALIDATE_BATCH_SIZE_NOT_NONE = False  # Validated separately for children.
   _VALIDATE_BATCH_SIZE_NONE = True  # Can't set batch size for wrapper.
 
@@ -712,9 +747,10 @@ class MultiInput(BaseInput):
       input_to_params: Dict from input names to input generator parameter
         definitions for each input. Input generators need to implement
         BaseInput.
-      default_input: Default input to use for ids_to_strings or other
-        input generator methods.
+      default_input: Default input to use for ids_to_strings or other input
+        generator methods.
     """
+
     input_to_params: Dict[str, BaseInput.HParams] = None
     default_input: str = None
 
@@ -722,11 +758,18 @@ class MultiInput(BaseInput):
   def get_batch_size(cls, hparams: MultiInput.HParams) -> int:
     assert hparams.input_to_params
     logging.warning(
-        'get_batch_size for MultiInput only returns batch size for the first '
-        'input. This might be different from batch sizes for other inputs.'
+        'get_batch_size for MultiInput only returns the outer batch size '
+        'determined from the children input generators. This will be different '
+        'from the actual batch sizes for children inputs.'
     )
-    first = list(hparams.input_to_params.values())[0]
-    return first.cls.get_batch_size(first)
+    children_batch_sizes = []
+    for child_ig_hparams in hparams.input_to_params.values():
+      children_batch_sizes.append(
+          child_ig_hparams.cls.get_batch_size(child_ig_hparams)
+      )
+    if len(children_batch_sizes) == 1:
+      return children_batch_sizes[0]
+    return math.gcd(*children_batch_sizes)
 
   def __init__(self, hparams: MultiInput.HParams) -> None:
     if self._VALIDATE_BATCH_SIZE_NONE and hparams.batch_size is not None:
@@ -763,7 +806,10 @@ class MultiInput(BaseInput):
     input_batches = {}
     for input_name, input_gen in self._inputs.items():
       input_batches[input_name] = input_gen.get_next()
-    return NestedMap(input_batches)
+    combined_batch = NestedMap(input_batches)
+    outer_batch_size = self.hparams.cls.get_batch_size(self.hparams)
+    return combined_batch.Transform(
+        lambda x: py_utils.reshape_with_outer_batch_size(x, outer_batch_size))
 
   def get_child(self, input_name: str) -> NestedJTensor:
     return self._inputs[input_name]

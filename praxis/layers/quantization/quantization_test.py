@@ -20,13 +20,15 @@ import jax
 from jax import numpy as jnp
 import numpy as np
 from praxis import base_layer
+from praxis import pax_fiddle
 from praxis import test_utils
 from praxis.layers import repeats
 from praxis.layers.quantization import linears as qlinears
 from praxis.layers.quantization import operations
+from praxis.layers.quantization import quantization_hparams
 
 instantiate = base_layer.instantiate
-BaseHParams = base_layer.BaseLayer.HParams
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 WeightInit = base_layer.WeightInit
 WeightHParams = base_layer.WeightHParams
 
@@ -39,13 +41,16 @@ class RepeatsLinearQuantizeTest(test_utils.TestCase):
 
   def test_quantize_repeats(self):
 
-    sub_p = qlinears.Linear.HParams(
+    sub_p = pax_fiddle.Config(
+        qlinears.Linear,
         name='_linear_q',
         input_dims=2,
         output_dims=2,
-        quantization=base_layer.QuantizationHParams(
-            mode=base_layer.QuantizationMode.QUANTIZE))
-    p = repeats.Repeat.HParams(name='ffn', sub_tpl=sub_p, x_times=3)
+        quantization=quantization_hparams.QuantizationHParams(
+            mode=quantization_hparams.QuantizationMode.TRAINING
+        ),
+    )
+    p = pax_fiddle.Config(repeats.Repeat, name='ffn', sub_tpl=sub_p, x_times=3)
     ffn = instantiate(p)
 
     inputs = np.random.normal(1.0, 1.5, [2, 2]).astype(np.float32)
@@ -77,17 +82,17 @@ class RepeatsLinearQuantizeTest(test_utils.TestCase):
 
 class FeedForwardQuant(base_layer.BaseLayer):
   """Feedforward layer with quantize_weight() method."""
-
-  class HParams(BaseHParams):
-    input_dim: int = 0
-    output_dim: int = 0
+  input_dim: int = 0
+  output_dim: int = 0
 
   def setup(self):
-    p = self.hparams
     self.create_variable(
         'w',
         WeightHParams(
-            shape=[p.input_dim, p.output_dim], init=WeightInit.Gaussian(1.0)))
+            shape=[self.input_dim, self.output_dim],
+            init=WeightInit.Gaussian(1.0),
+        ),
+    )
 
   def __call__(self, inputs):
     return jnp.einsum('...y,yz->...z', inputs, self.theta.w)
@@ -102,19 +107,21 @@ class FeedForwardQuant(base_layer.BaseLayer):
 
 class FeedForward(base_layer.BaseLayer):
   """Feedforward layer with default method."""
-
-  class HParams(BaseHParams):
-    input_dim: int = 0
-    output_dim: int = 0
+  input_dim: int = 0
+  output_dim: int = 0
 
   def setup(self):
-    p = self.hparams
     self.create_variable(
         'w',
         WeightHParams(
-            shape=[p.input_dim, p.output_dim], init=WeightInit.Gaussian(1.0)))
+            shape=[self.input_dim, self.output_dim],
+            init=WeightInit.Gaussian(1.0),
+        ),
+    )
     self.create_variable(
-        'b', WeightHParams(shape=[p.output_dim], init=WeightInit.Gaussian(1.0)))
+        'b',
+        WeightHParams(shape=[self.output_dim], init=WeightInit.Gaussian(1.0)),
+    )
 
   def __call__(self, inputs):
     res = jnp.einsum('...y,yz->...z', inputs, self.theta.w)
@@ -122,19 +129,16 @@ class FeedForward(base_layer.BaseLayer):
 
 
 class ParentLayer(base_layer.BaseLayer):
-
-  class HParams(BaseHParams):
-    ff1_tpl: BaseHParams = base_layer.sub_config_field(FeedForwardQuant.HParams)
-    ff2_tpl: BaseHParams = base_layer.sub_config_field(FeedForward.HParams)
+  ff1_tpl: LayerTpl = base_layer.template_field(FeedForwardQuant)
+  ff2_tpl: LayerTpl = base_layer.template_field(FeedForward)
 
   def setup(self):
-    p = self.hparams
     self.create_child(
-        'ff1',
-        p.ff1_tpl.clone().set(name='ff1', input_dim=3, output_dim=2))
+        'ff1', self.ff1_tpl.clone().set(name='ff1', input_dim=3, output_dim=2)
+    )
     self.create_child(
-        'ff2',
-        p.ff2_tpl.clone().set(name='ff2', input_dim=2, output_dim=3))
+        'ff2', self.ff2_tpl.clone().set(name='ff2', input_dim=2, output_dim=3)
+    )
 
   def __call__(self, inputs):
     return self.ff2(self.ff1(inputs))
@@ -147,7 +151,7 @@ class ChildrenQuantizeTest(test_utils.TestCase):
     np.random.seed(123456)
 
   def test_quantize_parent(self):
-    p = ParentLayer.HParams(name='_parent_q')
+    p = pax_fiddle.Config(ParentLayer, name='_parent_q')
     layer = instantiate(p)
 
     inputs = np.random.normal(1.5, 2.0, [5, 3]).astype(np.float32)

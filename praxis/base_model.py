@@ -24,6 +24,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from praxis import base_input
 from praxis import base_layer
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
 
@@ -32,7 +33,7 @@ JTensor = pytypes.JTensor
 Metrics = pytypes.Metrics
 WeightedScalars = pytypes.WeightedScalars
 Predictions = Union[JTensor, NestedMap, Dict[str, Any], Dict[int, Any]]
-BaseHParams = base_layer.BaseLayer.HParams
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 
 DecodeOut = Tuple[WeightedScalars, NestedMap, Metrics]
 ProcessDecodeOut = Tuple[WeightedScalars, Sequence[Tuple[str, Any]], Metrics]
@@ -64,7 +65,7 @@ class BaseModel(base_layer.BaseLayer):
     raise NotImplementedError('Abstract method')
 
   def compute_loss(
-      self, predictions: Union[JTensor, NestedMap],
+      self, predictions: Predictions,
       input_batch: NestedMap) -> Tuple[WeightedScalars, Dict[str, Any]]:
     """Computes the loss and other metrics for the given predictions.
 
@@ -142,22 +143,19 @@ class BaseModel(base_layer.BaseLayer):
 
 
 class LegosModel(BaseModel):
-  """Legos - A set of components that can be co-trained or trained in parts."""
+  """Legos - A set of components that can be co-trained or trained in parts.
 
-  class HParams(BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      components: List of model components aggregated into a single legos model.
-    """
-    components: Optional[BaseHParams] = base_layer.sub_config_field(None)
+  Attributes:
+    components: List of model components aggregated into a single legos model.
+  """
+  components: Optional[LayerTpl] = base_layer.template_field(None)
 
   def setup(self) -> None:
     """Build the mixer from the collection of components."""
     # TODO(b/227407216): Check that this is robust enough and/or fix if needed.
-    for f in dataclasses.fields(self.hparams.components):
-      if hasattr(self.hparams.components, f.name):
-        self.create_child(f.name, getattr(self.hparams.components, f.name))
+    for f in dataclasses.fields(self.components):
+      if hasattr(self.components, f.name):
+        self.create_child(f.name, getattr(self.components, f.name))
 
-  def get_model_params(self, name: str) -> BaseModel.HParams:
+  def get_model_params(self, name: str) -> pax_fiddle.Config[BaseModel]:
     raise NotImplementedError('Abstract method')

@@ -16,11 +16,13 @@
 """Adapter layers."""
 
 from typing import Optional
+import fiddle as fdl
 
 import jax
 import jax.numpy as jnp
 from praxis import asserts
 from praxis import base_layer
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
 from praxis.layers import activations
@@ -32,8 +34,8 @@ JTensor = pytypes.JTensor
 weight_init = base_layer.WeightInit
 WeightHParams = base_layer.WeightHParams
 sub_config_field = base_layer.sub_config_field
-
-BaseHParams = base_layer.BaseLayer.HParams
+template_field = base_layer.template_field
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 
 
 class MultitaskResidualAdapter(base_layer.BaseLayer):
@@ -48,56 +50,54 @@ class MultitaskResidualAdapter(base_layer.BaseLayer):
   This is a multi-task residual adapter and each task has its own adapter
   conditioning on the task id which is provided during fprop.
 
+  Attributes:
+    input_dims: input dimension to the Adapter
+    bottleneck_dims: bottleneck dimension of the adapter
+    num_tasks: total number of tasks
+    norm_tpl: normalization used in the beginning
+    activation_tpl: activation template to use.
   """
-
-  class HParams(BaseHParams):
-    """Associated hyperparams for this layer class.
-
-    Attributes:
-      input_dims: input dimension to the Adapter
-      bottleneck_dims: bottleneck dimension of the adapter
-      num_tasks: total number of tasks
-      norm_tpl: normalization used in the beginning
-      activation_tpl: activation template to use.
-    """
-    input_dims: int = 0
-    bottleneck_dims: int = 0
-    num_tasks: int = 1
-    norm_tpl: Optional[BaseHParams] = sub_config_field(
-        normalizations.LayerNorm.HParams)
-    activation_tpl: activations.BaseActivation.HParams = sub_config_field(
-        activations.ReLU.HParams)
+  input_dims: int = 0
+  bottleneck_dims: int = 0
+  num_tasks: int = 1
+  norm_tpl: Optional[LayerTpl] = template_field(normalizations.LayerNorm)
+  activation_tpl: pax_fiddle.Config[
+      activations.BaseActivation
+  ] = template_field(activations.ReLU)
 
   def setup(self) -> None:
-    p = self.hparams
-    if p.norm_tpl:
-      norm_tpl = p.norm_tpl.clone()
-      if norm_tpl.cls in {
-          normalizations.BatchNorm, normalizations.GroupNorm,
-          normalizations.LayerNorm
+    if self.norm_tpl:
+      norm_tpl = self.norm_tpl.clone()
+      if fdl.get_callable(norm_tpl) in {
+          normalizations.BatchNorm,
+          normalizations.GroupNorm,
+          normalizations.LayerNorm,
       }:
-        norm_tpl.dim = p.input_dims
+        norm_tpl.dim = self.input_dims
       else:
-        raise NotImplementedError('%s is not supported' % norm_tpl.cls)
+        raise NotImplementedError(
+            '%s is not supported' % fdl.get_callable(norm_tpl)
+        )
       self.create_child('norm', norm_tpl)
 
     # down_b_pc could be zero-initialized but no performance gain is observed
     # up_b_pc should not be zero-initialized from results
 
     down_w_pc = WeightHParams(
-        shape=[p.num_tasks, p.input_dims, p.bottleneck_dims])
+        shape=[self.num_tasks, self.input_dims, self.bottleneck_dims]
+    )
     self.create_variable('down_w', down_w_pc)
-    down_b_pc = WeightHParams(
-        shape=[p.num_tasks, p.bottleneck_dims])
+    down_b_pc = WeightHParams(shape=[self.num_tasks, self.bottleneck_dims])
     self.create_variable('down_b', down_b_pc)
     up_w_pc = WeightHParams(
-        shape=[p.num_tasks, p.bottleneck_dims, p.input_dims],
-        init=weight_init.Constant(0.))
+        shape=[self.num_tasks, self.bottleneck_dims, self.input_dims],
+        init=weight_init.Constant(0.0),
+    )
     self.create_variable('up_w', up_w_pc)
-    up_b_pc = WeightHParams(shape=[p.num_tasks, p.input_dims])
+    up_b_pc = WeightHParams(shape=[self.num_tasks, self.input_dims])
     self.create_variable('up_b', up_b_pc)
 
-    self.create_child('activation', p.activation_tpl)
+    self.create_child('activation', self.activation_tpl)
 
   def __call__(self,
                inputs: JTensor,
@@ -121,17 +121,19 @@ class MultitaskResidualAdapter(base_layer.BaseLayer):
     Returns:
       A tensor containing the adapted activations with the same shape as inputs.
     """
-    p = self.hparams
 
     if tasks is None:
-      asserts.eq(1, p.num_tasks, msg='tasks is not specified but num_tasks!=1')
+      asserts.eq(
+          1, self.num_tasks, msg='tasks is not specified but num_tasks!=1'
+      )
       tasks = jnp.zeros(shape=inputs.shape[:-1])
 
     asserts.eq(tasks.shape, inputs.shape[:len(tasks.shape)])
     asserts.gt(len(inputs.shape) - len(tasks.shape), 0)
     asserts.le(len(inputs.shape) - len(tasks.shape), 2)
     tasks_onehot = jax.nn.one_hot(
-        tasks, p.num_tasks, axis=-1, dtype=inputs.dtype)
+        tasks, self.num_tasks, axis=-1, dtype=inputs.dtype
+    )
 
     # Einsum axis names:
     # k - task
@@ -152,14 +154,15 @@ class MultitaskResidualAdapter(base_layer.BaseLayer):
       up_b = jnp.expand_dims(up_b, -2)
 
     # Norm -> down-projection -> non-linearity -> up-projection
-    if p.norm_tpl:
-      if p.norm_tpl.cls in {
-          normalizations.BatchNorm, normalizations.GroupNorm,
-          normalizations.LayerNorm
+    if self.norm_tpl:
+      if self.norm_tpl.cls in {
+          normalizations.BatchNorm,
+          normalizations.GroupNorm,
+          normalizations.LayerNorm,
       }:
         norm_inputs = self.norm(inputs, paddings)
       else:
-        raise NotImplementedError('%s is not supported' % p.norm_tpl.cls)
+        raise NotImplementedError('%s is not supported' % self.norm_tpl.cls)
     else:
       norm_inputs = inputs
 
@@ -187,25 +190,20 @@ class AdaptedTransformerFeedForward(transformers.TransformerFeedForward):
   parallel adds it to the residual branch.
 
   It is recommended to set norm_tpl to None.
+
+  Attributes:
+    adapter_tpl: Parameterization of adapter layer added after each block.
+    mode: sequential or parallel.
   """
-
-  class HParams(transformers.TransformerFeedForward.HParams):
-    """Associated hyperparams for this layer class.
-
-    Attributes:
-      adapter_tpl: Parameterization of adapter layer added after each block.
-      mode: sequential or parallel.
-    """
-    adapter_tpl: BaseHParams = None
-    mode: str = 'sequential'
+  adapter_tpl: LayerTpl = template_field(None)
+  mode: str = 'sequential'
 
   def setup(self):
-    p = self.hparams
     super(AdaptedTransformerFeedForward, self).setup()
-    assert p.mode in ['sequential', 'parallel']
-    self.create_child('adapters', p.adapter_tpl)
+    assert self.mode in ['sequential', 'parallel']
+    self.create_child('adapters', self.adapter_tpl)
 
-    if p.residual_droppath_prob:
+    if self.residual_droppath_prob:
       raise NotImplementedError(
           'residual droppath prob is not supported by adapter')
 
@@ -214,24 +212,23 @@ class AdaptedTransformerFeedForward(transformers.TransformerFeedForward):
                paddings: Optional[JTensor] = None,
                segment_ids: Optional[JTensor] = None,
                tasks: Optional[JTensor] = None) -> JTensor:
-    p = self.hparams
 
     x = super(AdaptedTransformerFeedForward, self).__call__(
         inputs, paddings, segment_ids=segment_ids)
 
     # Revert residual connection
-    if p.add_skip_connection:
-      x = (x - inputs) / p.residual_weight
+    if self.add_skip_connection:
+      x = (x - inputs) / self.residual_weight
 
-    if p.mode == 'sequential':
+    if self.mode == 'sequential':
       x = self.adapters(x, paddings, add_residual=False, tasks=tasks) + x
-    elif p.mode == 'parallel':
+    elif self.mode == 'parallel':
       x = self.adapters(inputs, paddings, add_residual=False, tasks=tasks) + x
     else:
-      raise ValueError(f'Wrong adapter type: {p.mode}')
+      raise ValueError(f'Wrong adapter type: {self.mode}')
 
-    if p.add_skip_connection:
-      assert not p.residual_droppath_prob
-      x = inputs + x * p.residual_weight
+    if self.add_skip_connection:
+      assert not self.residual_droppath_prob
+      x = inputs + x * self.residual_weight
 
     return x

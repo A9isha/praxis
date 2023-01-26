@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Utility functions for JAX tests."""
-
+import math
 import os
 from typing import Any, Mapping, Optional
 
@@ -38,6 +38,25 @@ _dtype = lambda x: getattr(x, 'dtype', None) or np.asarray(x).dtype
 class TestCase(parameterized.TestCase):
   """Test method for flax tests."""
 
+  def assertNear(self, f1, f2, err, msg=None):
+    """Asserts that two floats are near each other.
+
+    Checks that |f1 - f2| < err and asserts a test failure
+    if not.
+
+    Args:
+      f1: A float value.
+      f2: A float value.
+      err: A float value.
+      msg: An optional string message to append to the failure message.
+    """
+    # f1 == f2 is needed here as we might have: f1, f2 = inf, inf
+    self.assertTrue(
+        f1 == f2 or math.fabs(f1 - f2) <= err,
+        '%f != %f +/- %f%s'
+        % (f1, f2, err, ' (%s)' % msg if msg is not None else ''),
+    )
+
   def assertAllClose(self,
                      x,
                      y,
@@ -53,6 +72,19 @@ class TestCase(parameterized.TestCase):
     x = x.astype(np.float32) if x.dtype == jnp.bfloat16 else x
     y = y.astype(np.float32) if y.dtype == jnp.bfloat16 else y
     np.testing.assert_allclose(x, y, rtol=rtol, atol=atol, **kwargs)
+
+  def assertNotAllClose(
+      self, x, y, check_dtypes=True, rtol=1E-5, atol=1E-5, **kwargs):
+    """Asserts that two arrays do not have near values."""
+    try:
+      self.assertAllClose(x, y, rtol=rtol, atol=atol,
+                          check_dtypes=check_dtypes,
+                          **kwargs)
+    except AssertionError:
+      return
+    raise AssertionError(
+        'The two values are close at all elements. %s %s' % (x, y)
+    )
 
   def assertArraysEqual(self, x, y, check_dtypes=True, **kwargs):
     """Wrapper for np.testing.assert_array_equal()."""
@@ -169,8 +201,12 @@ def replace_jax_attention_vars_to_tf(
   tf_initial_vars.fflayer.residual_dropout = py_utils.NestedMap()
   if is_moe:
     tf_initial_vars.fflayer.fflayer.layer_norm = py_utils.NestedMap()
-    tf_initial_vars.fflayer.fflayer.layer_norm.scale = jax_initial_vars.ff_layer.layer_norm.scale
-    tf_initial_vars.fflayer.fflayer.layer_norm.bias = jax_initial_vars.ff_layer.layer_norm.bias
+    tf_initial_vars.fflayer.fflayer.layer_norm.scale = (
+        jax_initial_vars.ff_layer.layer_norm.scale
+    )
+    tf_initial_vars.fflayer.fflayer.layer_norm.bias = (
+        jax_initial_vars.ff_layer.layer_norm.bias
+    )
     tf_initial_vars.fflayer.fflayer.gate = jax_initial_vars.ff_layer.gate
     tf_initial_vars.fflayer.fflayer.wi_0 = jax_initial_vars.ff_layer.wi_0
     tf_initial_vars.fflayer.fflayer.wo_0 = jax_initial_vars.ff_layer.wo_0
@@ -383,7 +419,9 @@ def replace_jax_conformer_layer_vars_to_tf(
 
   tf_initial_vars.fflayer_start = py_utils.NestedMap()
   tf_initial_vars.fflayer_start.residual_dropout = py_utils.NestedMap()
-  tf_initial_vars.fflayer_start.layer_norm = jax_initial_vars.fflayer_start.layer_norm
+  tf_initial_vars.fflayer_start.layer_norm = (
+      jax_initial_vars.fflayer_start.layer_norm
+  )
   tf_initial_vars.fflayer_start.fflayer = py_utils.NestedMap()
   tf_initial_vars.fflayer_start.fflayer.dropout = [
       py_utils.NestedMap(), py_utils.NestedMap()
@@ -401,7 +439,9 @@ def replace_jax_conformer_layer_vars_to_tf(
       1].b = jax_initial_vars.fflayer_start.ffn_layer2.bias.b
 
   tf_initial_vars.fflayer_end = py_utils.NestedMap()
-  tf_initial_vars.fflayer_end.layer_norm = jax_initial_vars.fflayer_end.layer_norm
+  tf_initial_vars.fflayer_end.layer_norm = (
+      jax_initial_vars.fflayer_end.layer_norm
+  )
   tf_initial_vars.fflayer_end.residual_dropout = py_utils.NestedMap()
   tf_initial_vars.fflayer_end.fflayer = py_utils.NestedMap()
   tf_initial_vars.fflayer_end.fflayer.dropout = [

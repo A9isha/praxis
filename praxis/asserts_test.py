@@ -17,6 +17,8 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from jax.experimental import jax2tf
+import numpy as np
 from praxis import asserts
 from praxis import py_utils
 
@@ -164,7 +166,8 @@ class AssertsTest(parameterized.TestCase):
   def test_ge_raises(self, value1, value2):
     with self.assertRaisesRegex(
         ValueError,
-        f'`value1={value1}` must be greater than or equal to `value2={value2}`.$'
+        f'`value1={value1}` must be greater than or '
+        f'equal to `value2={value2}`.$'
     ):
       asserts.ge(value1, value2)
 
@@ -188,6 +191,32 @@ class AssertsTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError,
                                 f'`value={value}` must be within `.*`.$'):
       asserts.in_set(value, elements)
+
+  def test_in_set_jax2tf_context(self):
+    jax2tf.convert(
+        lambda x: asserts.in_set(x.shape[0], [1, x.shape[0]]),
+        polymorphic_shapes='b',
+    )(np.zeros((1,)))
+
+    jax2tf.convert(
+        lambda x: asserts.in_set(x.shape[0], [x.shape[0], 1]),
+        polymorphic_shapes='b',
+    )(np.zeros((1,)))
+
+    jax2tf.convert(
+        lambda x: asserts.in_set(1, [x.shape[0], 1]), polymorphic_shapes='b'
+    )(np.zeros((1,)))
+
+  def test_in_set_jax2tf_context_raises(self):
+    with self.assertRaisesRegex(ValueError, '`.*` must be within `.*`.$'):
+      jax2tf.convert(
+          lambda x: asserts.in_set(x.shape[0], [1, 4]), polymorphic_shapes='b'
+      )(np.zeros((1,)))
+
+    with self.assertRaisesRegex(ValueError, '`.*` must be within `.*`.$'):
+      jax2tf.convert(
+          lambda x: asserts.in_set(1, [x.shape[0], 4]), polymorphic_shapes='b'
+      )(np.zeros((1,)))
 
   @parameterized.parameters((1, 0, 2, False, False),
                             (1.2, 1.2, 5.6, False, True),
@@ -267,6 +296,28 @@ class AssertsTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, 'Not the same structure.*'):
       asserts.assert_same_structure(x, y)
 
+  def test_assertions_disabled(self):
+    with asserts.AssertsContext(enabled=False):
+      # All of these would fail but shouldn't raise an assertions.
+      asserts.between(10, 0, 1)
+      asserts.eq(1, 2)
+      asserts.ge(1, 2)
+      asserts.gt(1, 2)
+      asserts.in_set(5, [1,2])
+      asserts.instance(int, float)
+      asserts.le(2, 1)
+      asserts.lt(2, 1)
+      asserts.ne(1, 1)
+      asserts.not_none(None)
+      asserts.subclass(str, float)
+
+  def test_assertions_nested(self):
+    value = None
+    with asserts.AssertsContext(enabled=False):
+      with asserts.AssertsContext(enabled=True):
+        with self.assertRaisesRegex(ValueError,
+                                    f'`value={value}` must not be `None`.$'):
+          asserts.not_none(value)
 
 if __name__ == '__main__':
   absltest.main()

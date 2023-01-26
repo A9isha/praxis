@@ -18,7 +18,7 @@
 import collections
 import re
 import time
-from typing import Any
+from typing import Any, List
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -31,7 +31,14 @@ import numpy as np
 from praxis import base_layer
 from praxis import py_utils
 from praxis import test_utils
-from praxis import train_states
+
+
+class TrainState(struct.PyTreeNode):
+  """Simple train state."""
+
+  step: base_layer.JTensorOrPartitionSpec
+  mdl_vars: base_layer.NestedJTensorOrPartitionSpec
+  opt_states: List[base_layer.NestedJTensorOrPartitionSpec]
 
 
 class PyUtilsTest(test_utils.TestCase):
@@ -50,8 +57,9 @@ class PyUtilsTest(test_utils.TestCase):
         {'w': base_layer.WeightHParams(shape=(4, 8))},
         mesh_shape=[1, 1],
         device_axis_names=['a', 'b'])
-    train_state_partition_specs = train_states.TrainState(
-        step=pjit.PartitionSpec(), mdl_vars=w_sepc, opt_states={})
+    train_state_partition_specs = TrainState(
+        step=pjit.PartitionSpec(), mdl_vars=w_sepc, opt_states=[]
+    )
     nested_names = py_utils.extract_prefixed_keys_from_nested_map(
         train_state_partition_specs)
     flattened_names, _ = jax.tree_util.tree_flatten(nested_names)
@@ -210,16 +218,15 @@ class PyUtilsTest(test_utils.TestCase):
         a=np_module.reshape(np_module.arange(batch_size), (batch_size, 1)),
         b=py_utils.NestedMap(
             c=np_module.reshape(
-                np_module.arange(batch_size * 2 * 3), (batch_size, 2, 3)),
-        ),
+                np_module.arange(batch_size * 2 * 3), (batch_size, 2, 3)),),
     )
 
     flat_trees = py_utils.tree_unstack(tree, batch_axis)
     self.assertLen(flat_trees, batch_size)
 
     # Merge tree back
-    merged_tree = jax.tree_map(
-        lambda x: np_module.expand_dims(x, batch_axis), flat_trees[0])
+    merged_tree = jax.tree_map(lambda x: np_module.expand_dims(x, batch_axis),
+                               flat_trees[0])
 
     def _concat_tree_with_batch(x_batch, y):
       y_batch = np_module.expand_dims(y, batch_axis)
@@ -254,6 +261,57 @@ class PyUtilsTest(test_utils.TestCase):
         padding=np.array([[0.0], [1.0], [0.0]]),
         use_select=False)
     self.assertAllClose(y, [[1.0, 2.0], [0.0, 0.0], [5.0, 6.0]])
+
+  def test_apply_padding_with_axis_0(self):
+    y = py_utils.apply_padding(
+        inputs=np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+        padding=np.array([[0.0], [1.0], [0.0]]),
+        axis=0)
+    self.assertAllClose(y, [[1.0, 2.0], [0.0, 0.0], [5.0, 6.0]])
+
+  def test_apply_padding_with_axis_0_and_one_more_dim(self):
+    # inputs=[3, 2] and paddings=[3, 2, 1]
+    y = py_utils.apply_padding(
+        inputs=np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+        padding=np.expand_dims(
+            np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]), -1),
+        axis=0)
+    self.assertAllClose(y, [[1.0, 2.0], [0.0, 4.0], [5.0, 0.0]])
+
+  def test_pad_inputs_with_axis_0_and_one_less_dim(self):
+    # inputs=[1, 2, 3] and paddings=[1, 2]
+    y = py_utils.apply_padding(
+        inputs=np.array([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]),
+        padding=np.array([[1.0, 0.0]]),
+        axis=0)
+    self.assertAllClose(y, [[[0.0, 0.0, 0.0], [4.0, 5.0, 6.0]]])
+
+  def test_apply_padding_with_axis_1_and_one_more_dim(self):
+    # inputs=[3, 2] and paddings=[3, 2, 1]
+    y = py_utils.apply_padding(
+        inputs=np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+        padding=np.expand_dims(
+            np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]), -1),
+        axis=1)
+    self.assertAllClose(y, [[1.0, 2.0], [0.0, 4.0], [5.0, 0.0]])
+
+  def test_pad_inputs_with_axis_1_and_same_rank(self):
+    # inputs=[5, 1, 2, 3] and paddings=[1, 2, 1]
+    batch = 5
+    y = py_utils.apply_padding(
+        inputs=np.array([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]] * batch),
+        padding=np.expand_dims(np.array([[1.0, 0.0]]), -1),
+        axis=1)
+    self.assertAllClose(y, [[[0.0, 0.0, 0.0], [4.0, 5.0, 6.0]]] * batch)
+
+  def test_pad_inputs_with_axis_1_and_one_less_dim(self):
+    # inputs=[5, 1, 2, 3] and paddings=[1, 2]
+    batch = 5
+    y = py_utils.apply_padding(
+        inputs=np.array([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]] * batch),
+        padding=np.array([[1.0, 0.0]]),
+        axis=1)
+    self.assertAllClose(y, [[[0.0, 0.0, 0.0], [4.0, 5.0, 6.0]]] * batch)
 
   def test_timeit(self):
     start_time = time.time()
@@ -297,6 +355,20 @@ class PyUtilsTest(test_utils.TestCase):
     })
     restored_p1 = flax.serialization.from_state_dict(p2, state_dict)
     self.assertEqual(restored_p1, p1)
+
+  @parameterized.named_parameters(
+      ('_pad0', 0),
+      ('_pad1', 1),
+  )
+  def test_pad_or_trim_to(self, pad_val):
+    key = jax.random.PRNGKey(seed=123456)
+    x = jax.random.normal(key, shape=(3, 3))
+    shape = [4, 6]
+    padded_x = py_utils.pad_or_trim_to(x, shape, pad_val=pad_val)
+    self.assertEqual(padded_x.shape, (4, 6))
+    self.assertAllClose(x, padded_x[:3, :3])
+    sum_diff = jnp.sum(padded_x) - jnp.sum(x)
+    self.assertAllClose(sum_diff, pad_val * 15.0)
 
 
 if __name__ == '__main__':

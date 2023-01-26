@@ -14,12 +14,16 @@
 # limitations under the License.
 
 """HParams for the decoder."""
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 from praxis import base_hyperparams
+from praxis import base_layer
 from praxis import pytypes
+from praxis import sample_decode
 BaseHyperParams = base_hyperparams.BaseHyperParams
 JTensor = pytypes.JTensor
+
+sub_config_field = base_layer.sub_config_field
 
 
 class DecoderHParams(BaseHyperParams):
@@ -29,24 +33,28 @@ class DecoderHParams(BaseHyperParams):
     seqlen: Maximum output sequence length.
     min_prefix_len: Minimum number of tokens picked to be used as decoding
       prefix.
-    eos_id: The id of EOS token indicating the termination of greedy search.
+    eos_id: The id of EOS token indicating the termination decoding. Could be
+      either a sequence or an integer.
     max_decode_steps: If not None, the max decode steps for each example. If
-      None, this is set to `seqlen`, which contains prefix.
-    fprop_for_prefix: Whether or not uses fprop instead of extend_step for
-      the prefix.
+      None, this is set to `seqlen`, which contains prefix. If it is a list,
+      decoding state will be padded at each given steps.
+    fprop_for_prefix: Whether or not uses fprop instead of extend_step for the
+      prefix.
     lazy_prefix_broadcast: Whether to enable the lazy-prefix-broadcast
       optimization for multi-sample decoding with shared prefixes. Requires
       fprop_for_prefix. This requires an implementation of the
       lazy_broadcast_prefix() method in the attention layer, which is
       DotProductAttentionWithLPB.
+    decode_loop_mesh_axes_transpose: Optional mesh transpose for decoding loop.
   """
   # TODO(b/229679837): remove seqlen and uses max_decode_steps.
   seqlen: int = 0
   min_prefix_len: int = 5
-  eos_id: int = 2
-  max_decode_steps: Optional[int] = None
+  eos_id: Union[int, Sequence[int]] = 2
+  max_decode_steps: Optional[Union[int, Sequence[int]]] = None
   fprop_for_prefix: bool = False
   lazy_prefix_broadcast: bool = False
+  decode_loop_mesh_axes_transpose: Optional[Dict[str, str]] = None
 
 
 class GreedyDecoderHParams(DecoderHParams):
@@ -59,11 +67,9 @@ class BeamSearchHParams(DecoderHParams):
   Attributes:
     beam_size: Beam size for decoding.
     length_norm_alpha: Length norm alpha for beam search.
-    parse_tokens: Token ids used for parsing out answers from model outputs.
   """
   beam_size: int = 1
   length_norm_alpha: float = 0.8
-  parse_tokens: Optional[List[int]] = None
 
 
 class FlatBeamSearchHParams(BeamSearchHParams):
@@ -81,9 +87,15 @@ class SampleDecoderHParams(DecoderHParams):
     p: if not None, use the smallest number of logits whose cumulative sum of
       probs adds up to (at least) p. Notice that it should not be used with k
       at the same time.
+    next_token_sampler_tpl: HParams for the layer used to sample next token ids
+      given the logits output.
+    cf_guidance_scale: If not None, apply classifier-free guidance.
   """
   num_samples: int = 1
   # TODO(wangtao): supports per-example temperature.
   temperature: float = 1.0
   k: int = 40
   p: Optional[Union[float, JTensor]] = None
+  next_token_sampler_tpl: sample_decode.BaseNextTokenSampler.HParams = (
+      sub_config_field(sample_decode.DefaultNextTokenSampler.HParams))
+  cf_guidance_scale: Optional[Union[List[float], float]] = None

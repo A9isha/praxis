@@ -16,6 +16,7 @@
 """Unit tests for beam_search."""
 
 from typing import Any
+from praxis import pax_fiddle
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -30,7 +31,6 @@ from praxis.layers import models
 from praxis.layers import transformer_models
 
 NestedMap = py_utils.NestedMap
-BaseHParams = base_layer.BaseLayer.HParams
 instantiate = base_layer.instantiate
 LanguageModelType = transformer_models.LanguageModelType
 
@@ -99,20 +99,17 @@ class BeamSearchHelperTest(test_utils.TestCase):
 
 
 class MockLM(base_layer.BaseLayer):
+  """Mock l m.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      logits: results returned by extend_step(), of shape [max step, batch size,
-        vocab size].
-    """
-    logits: Any = None
-    model_type: LanguageModelType = LanguageModelType.CAUSAL
+  Attributes:
+    logits: results returned by extend_step(), of shape [max step, batch size,
+      vocab size].
+  """
+  logits: Any = None
+  model_type: LanguageModelType = LanguageModelType.CAUSAL
 
   def setup(self) -> None:
-    p = self.hparams
-    self._logits = jnp.array(p.logits, dtype=jnp.float32)
+    self._logits = jnp.array(self.logits, dtype=jnp.float32)
 
   def __call__(self, *args: Any, **kwargs: Any) -> None:
     self.put_variable(DECODE_CACHE, 'time_step', 0)
@@ -135,10 +132,12 @@ class MockLM(base_layer.BaseLayer):
 class BeamSearchTest(test_utils.TestCase):
 
   def _run_decode(self, decoder_p, logits, input_batch):
-    p = models.LanguageModel.HParams(
+    p = pax_fiddle.Config(
+        models.LanguageModel,
         name='mock_lm',
         decoder_tpl=decoder_p.clone(),
-        lm_tpl=MockLM.HParams(logits=logits))
+        lm_tpl=pax_fiddle.Config(MockLM, logits=logits),
+    )
     lang_model = instantiate(p)
     theta = NestedMap(lm_tpl=NestedMap())
     # We fix seed to 9 to get the desired prefix lengths below.
@@ -168,12 +167,12 @@ class BeamSearchTest(test_utils.TestCase):
     seq_len = 5
     p = models.BeamSearchHParams(
         beam_size=4,
-        eos_id=4,
-        parse_tokens=parse_tokens,
+        eos_id=parse_tokens if parse_tokens else 4,
         fprop_for_prefix=True,
         max_decode_steps=3,
         seqlen=seq_len,
-        length_norm_alpha=length_norm_alpha)
+        length_norm_alpha=length_norm_alpha,
+    )
     logits = [[1, 0, 0, 2, 0], [5, 1, 0, 0, 0], [5, 0, 0, 1, 0],
               [0, 1, 0, 2, 10], [0, 0, 0, 0, 0]]
     logprobs = jax.nn.log_softmax(jnp.array(logits, dtype=jnp.float32))

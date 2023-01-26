@@ -16,6 +16,7 @@
 """Tests for Praxis repeats layers."""
 
 from absl.testing import absltest
+from praxis import pax_fiddle
 from absl.testing import parameterized
 import jax
 from jax import numpy as jnp
@@ -29,8 +30,6 @@ from praxis.layers import repeats
 NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
 WeightHParams = base_layer.WeightHParams
-
-BaseHParams = base_layer.BaseLayer.HParams
 SplitDimsMapping = base_layer.SplitDimsMapping
 
 instantiate = base_layer.instantiate
@@ -42,28 +41,27 @@ DECODE_CACHE = base_layer.DECODE_CACHE
 
 
 class FeedForward(base_layer.BaseLayer):
-  """Feedforward layer."""
+  """Feedforward layer.
 
-  class HParams(BaseHParams):
-    """Associated hyperparams for this layer class.
-
-    Attributes:
-      input_dim: Input dimension size.
-      output_dim: Output dimension size.
-    """
-    input_dim: int = 0
-    output_dim: int = 0
+  Attributes:
+    input_dim: Input dimension size.
+    output_dim: Output dimension size.
+  """
+  input_dim: int = 0
+  output_dim: int = 0
 
   def setup(self):
-    p = self.hparams
-    assert p.name
-    assert p.input_dim > 0
-    assert p.output_dim > 0
+    assert self.name
+    assert self.input_dim > 0
+    assert self.output_dim > 0
 
     self.create_variable(
         'w',
         WeightHParams(
-            shape=[p.input_dim, p.output_dim], init=WeightInit.Gaussian(1.0)))
+            shape=[self.input_dim, self.output_dim],
+            init=WeightInit.Gaussian(1.0),
+        ),
+    )
     self.create_variable(
         'step',
         WeightHParams(shape=[], dtype=jnp.int32, init=WeightInit.Constant(0)),
@@ -81,11 +79,10 @@ class FeedForward(base_layer.BaseLayer):
 class RepeatCalledTwice(base_layer.BaseLayer):
 
   def setup(self):
-    sub_p = FeedForward.HParams(input_dim=2, output_dim=2)
-    p = repeats.Repeat.HParams(
-        name='repeated_ffn',
-        sub_tpl=sub_p,
-        x_times=3)
+    sub_p = pax_fiddle.Config(FeedForward, input_dim=2, output_dim=2)
+    p = pax_fiddle.Config(
+        repeats.Repeat, name='repeated_ffn', sub_tpl=sub_p, x_times=3
+    )
 
     self.create_child('repeated_ffn', p)
 
@@ -96,25 +93,24 @@ class RepeatCalledTwice(base_layer.BaseLayer):
 
 
 class Decoder(base_layer.BaseLayer):
-  """Decoder layer."""
+  """Decoder layer.
 
-  class HParams(BaseHParams):
-    """Associated hyperparams for this layer class.
-
-    Attributes:
-      model_dim: Model dimension size.
-    """
-    model_dim: int = 0
+  Attributes:
+    model_dim: Model dimension size.
+  """
+  model_dim: int = 0
 
   def setup(self):
-    p = self.hparams
-    assert p.name
-    assert p.model_dim > 0
+    assert self.name
+    assert self.model_dim > 0
 
     self.create_variable(
         'w',
         WeightHParams(
-            shape=[p.model_dim, p.model_dim], init=WeightInit.Gaussian(1.0)))
+            shape=[self.model_dim, self.model_dim],
+            init=WeightInit.Gaussian(1.0),
+        ),
+    )
 
   def __call__(self, inputs):
     x = jnp.einsum('bty,yz->btz', inputs, self.theta.w)
@@ -142,12 +138,14 @@ class RepeatsTest(test_utils.TestCase):
   @parameterized.parameters((False,), (True,))
   def test_repeats(self, unpack_summaries):
 
-    sub_p = FeedForward.HParams(input_dim=2, output_dim=2)
-    p = repeats.Repeat.HParams(
+    sub_p = pax_fiddle.Config(FeedForward, input_dim=2, output_dim=2)
+    p = pax_fiddle.Config(
+        repeats.Repeat,
         name='repeated_ffn',
         sub_tpl=sub_p,
         x_times=5,
-        unpack_summaries=unpack_summaries)
+        unpack_summaries=unpack_summaries,
+    )
     repeated_ffn = instantiate(p)
 
     k = jax.random.PRNGKey(123)
@@ -199,12 +197,14 @@ class RepeatsTest(test_utils.TestCase):
   @parameterized.parameters((False,), (True,))
   def test_extend_step(self, unroll):
 
-    sub_p = Decoder.HParams(model_dim=4)
-    p = repeats.Repeat.HParams(
+    sub_p = pax_fiddle.Config(Decoder, model_dim=4)
+    p = pax_fiddle.Config(
+        repeats.Repeat,
         name='repeated_decoder',
         sub_tpl=sub_p,
         x_times=5,
-        unroll_in_decode=unroll)
+        unroll_in_decode=unroll,
+    )
     repeated_decoder = instantiate(p)
 
     k = jax.random.PRNGKey(123)
@@ -227,7 +227,7 @@ class RepeatsTest(test_utils.TestCase):
       self.assertAllClose(step_out, fprop_outs[:, t])
 
   def test_repeat_called_twice(self):
-    p = RepeatCalledTwice.HParams(name='repeat_called_twice')
+    p = pax_fiddle.Config(RepeatCalledTwice, name='repeat_called_twice')
     repeated_layer = instantiate(p)
 
     k = jax.random.PRNGKey(123)
@@ -246,8 +246,8 @@ class RepeatsQuantizeTest(test_utils.TestCase):
 
   def test_quantize_repeats(self):
 
-    sub_p = FeedForward.HParams(input_dim=2, output_dim=2)
-    p = repeats.Repeat.HParams(name='ffn', sub_tpl=sub_p, x_times=5)
+    sub_p = pax_fiddle.Config(FeedForward, input_dim=2, output_dim=2)
+    p = pax_fiddle.Config(repeats.Repeat, name='ffn', sub_tpl=sub_p, x_times=5)
     ffn = instantiate(p)
 
     inputs = np.random.normal(1.0, 1.5, [2, 2]).astype(np.float32)
@@ -271,7 +271,8 @@ class RepeatsQuantizeTest(test_utils.TestCase):
     self.assertEqual(shapes, expected_shapes)
 
     pspecs, _ = ffn.apply(
-        init_vars, mutable=[], method=ffn.quantized_partitioned_specs)
+        init_vars, mutable=[], method=ffn.quantized_partition_specs
+    )
     expected_pspecs = {
         'non_trainable': {
             'sub': {

@@ -30,8 +30,6 @@ from praxis import pytypes
 WeightHParams = base_layer.WeightHParams
 WeightInit = base_layer.WeightInit
 JTensor = pytypes.JTensor
-
-BaseHParams = base_layer.BaseLayer.HParams
 sub_config_field = base_layer.sub_config_field
 PARAMS = base_layer.PARAMS
 
@@ -135,49 +133,44 @@ class BregmanPCA(base_layer.BaseLayer):
   We use the following capital letters to denote shape parameters:
     B = batch size
     K = number of components
+
+  Attributes:
+    num_components: Number of PCA components.
+    input_dims: Dimensions of input
+    activation_type: The type of the activation function to use. See the
+      supported activation functions in the ActivationType enum above.
+    negative_slope: Negative slope for leaky ReLU.
+    mean_beta: EMA constant for updating the mean.
+    coefficients_lr: Learning rate for the coefficients.
+    coefficients_beta: EMA constant for the coefficients updates.
+    coefficients_steps: Number of steps for solving the coefficients.
+    components_lr: Learning rate for the PCA components.
+    components_beta: EMA constant for the PCA components updates.
+    start_step: Step number to start updating the components.
+    end_step: Step number to end updating the components.
+    constant_lr_schedule: Whether to use a constant learning rate schedule for
+      the components. Applies a linearly decaying schedule if False.
   """
-
-  class HParams(BaseHParams):
-    """Associated hyperparams for this layer class.
-
-    Attributes:
-      num_components: Number of PCA components.
-      input_dims: Dimensions of input
-      activation_type: The type of the activation function to use. See the
-        supported activation functions in the ActivationType enum above.
-      negative_slope: Negative slope for leaky ReLU.
-      mean_beta: EMA constant for updating the mean.
-      coefficients_lr: Learning rate for the coefficients.
-      coefficients_beta: EMA constant for the coefficients updates.
-      coefficients_steps: Number of steps for solving the coefficients.
-      components_lr: Learning rate for the PCA components.
-      components_beta: EMA constant for the PCA components updates.
-      start_step: Step number to start updating the components.
-      end_step: Step number to end updating the components.
-      constant_lr_schedule: Whether to use a constant learning rate schedule for
-        the components. Applies a linearly decaying schedule if False.
-    """
-    num_components: int = 0
-    input_dims: Union[int, Sequence[int]] = 0
-    activation_type: ActivationType = ActivationType.IDENTITY
-    negative_slope: float = 0.0
-    mean_beta: float = 0.99
-    coefficients_lr: float = 0.01
-    coefficients_beta: float = 0.9
-    coefficients_steps: int = 20
-    components_lr: float = 0.01
-    components_beta: float = 0.9
-    start_step: int = 0
-    end_step: int = 0
-    constant_lr_schedule: bool = True
+  num_components: int = 0
+  input_dims: Union[int, Sequence[int]] = 0
+  activation_type: ActivationType = ActivationType.IDENTITY
+  negative_slope: float = 0.0
+  mean_beta: float = 0.99
+  coefficients_lr: float = 0.01
+  coefficients_beta: float = 0.9
+  coefficients_steps: int = 20
+  components_lr: float = 0.01
+  components_beta: float = 0.9
+  start_step: int = 0
+  end_step: int = 0
+  constant_lr_schedule: bool = True
 
   def setup(self) -> None:
     """Constructs an instance with a mean and K principal components."""
-    p = self.hparams
-    assert p.num_components
-    assert p.input_dims
-    assert p.end_step > p.start_step
-    input_dims = p.input_dims
+    assert self.num_components
+    assert self.input_dims
+    assert self.end_step > self.start_step
+    input_dims = self.input_dims
     if not isinstance(input_dims, (list, tuple)):
       input_dims = [input_dims]
     elif isinstance(input_dims, tuple):
@@ -194,29 +187,36 @@ class BregmanPCA(base_layer.BaseLayer):
         init=WeightInit.Constant(0.0),
         collections=[base_layer.WeightHParamsCollection.REQUIRES_MEAN_SYNC])
     components = WeightHParams(
-        shape=[p.num_components] + input_dims,
-        collections=[base_layer.WeightHParamsCollection.REQUIRES_MEAN_SYNC])
+        shape=[self.num_components] + input_dims,
+        collections=[base_layer.WeightHParamsCollection.REQUIRES_MEAN_SYNC],
+    )
     components_momentum = WeightHParams(
-        shape=[p.num_components] + input_dims,
+        shape=[self.num_components] + input_dims,
         init=WeightInit.Constant(0.0),
-        collections=[base_layer.WeightHParamsCollection.REQUIRES_MEAN_SYNC])
-    if p.activation_type == ActivationType.IDENTITY:
+        collections=[base_layer.WeightHParamsCollection.REQUIRES_MEAN_SYNC],
+    )
+    if self.activation_type == ActivationType.IDENTITY:
       self.activation_fn = lambda x: x
       self.inv_activation_fn = lambda x: x
       self.bregman_loss_fn = _squared_loss
-    elif p.activation_type == ActivationType.LEAKY_RELU:
+    elif self.activation_type == ActivationType.LEAKY_RELU:
       self.activation_fn = functools.partial(
-          jax.nn.leaky_relu, negative_slope=p.negative_slope)
+          jax.nn.leaky_relu, negative_slope=self.negative_slope
+      )
       self.inv_activation_fn = functools.partial(
-          jax.nn.leaky_relu, negative_slope=1. / p.negative_slope)
+          jax.nn.leaky_relu, negative_slope=1.0 / self.negative_slope
+      )
       self.bregman_loss_fn = functools.partial(
-          _leaky_relu_loss, negative_slope=p.negative_slope)
-    elif p.activation_type == ActivationType.SOFTMAX:
+          _leaky_relu_loss, negative_slope=self.negative_slope
+      )
+    elif self.activation_type == ActivationType.SOFTMAX:
       self.activation_fn = nn.softmax
       self.inv_activation_fn = _inverse_softmax
       self.bregman_loss_fn = _softmax_loss
     else:
-      raise ValueError('Unknown activation type {}'.format(p.activation_type))
+      raise ValueError(
+          'Unknown activation type {}'.format(self.activation_type)
+      )
     self.coefficients_grad_fn = jax.grad(self.bregman_loss_fn, argnums=0)
     self.components_grad_fn = jax.grad(self.bregman_loss_fn, argnums=1)
     self.create_variable('step', step, trainable=False)
@@ -226,12 +226,13 @@ class BregmanPCA(base_layer.BaseLayer):
         'components_momentum', components_momentum, trainable=False)
 
   def base_learning_rate(self, step: JTensor) -> Tuple[JTensor, JTensor]:
-    p = self.hparams
-    constant_lr_schedule = p.constant_lr_schedule
+    constant_lr_schedule = self.constant_lr_schedule
     apply_update = jnp.where(
-        jnp.logical_and(step >= p.start_step, step < p.end_step), 1.0, 0.0)
+        jnp.logical_and(step >= self.start_step, step < self.end_step), 1.0, 0.0
+    )
     base_lr = jnp.maximum(
-        1. - (step - p.start_step) / (p.end_step - p.start_step), 0.0)
+        1.0 - (step - self.start_step) / (self.end_step - self.start_step), 0.0
+    )
     base_lr = jnp.where(constant_lr_schedule, 1.0, base_lr)
     base_lr = base_lr * apply_update
     return base_lr, apply_update
@@ -266,7 +267,6 @@ class BregmanPCA(base_layer.BaseLayer):
       fprop_dtype.
       coefficients: PCA coefficients of inputs.
     """
-    p = self.hparams
     mean = self.get_var('mean')
     components = self.get_var('components')
     components_momentum = self.get_var('components_momentum')
@@ -274,30 +274,32 @@ class BregmanPCA(base_layer.BaseLayer):
 
     def _iter_condition(carry):
       count, _, _, _, _ = carry
-      return count < p.coefficients_steps
+      return count < self.coefficients_steps
 
     def _iter_body(carry):
       count, coeffs, coeffs_mom, components, mean = carry
-      base_lr = 1. - count / p.coefficients_steps
+      base_lr = 1.0 - count / self.coefficients_steps
       coeffs_grad = self.coefficients_grad_fn(coeffs, components, mean, inputs)
       coeffs_grad_norm = jnp.maximum(jnp.linalg.norm(coeffs_grad), 1e-6)
       coeffs_grad = coeffs_grad / coeffs_grad_norm * jnp.sqrt(
           jnp.size(coeffs_grad))
       coeffs_mom = (
-          p.coefficients_beta * coeffs_mom +
-          (1. - p.coefficients_beta) * coeffs_grad)
-      coeffs -= base_lr * p.coefficients_lr * coeffs_mom
+          self.coefficients_beta * coeffs_mom
+          + (1.0 - self.coefficients_beta) * coeffs_grad
+      )
+      coeffs -= base_lr * self.coefficients_lr * coeffs_mom
       return count + 1, coeffs, coeffs_mom, components, mean
 
     if not self.do_eval:
       step = self.get_var('step')
       base_lr, apply_update = self.base_learning_rate(step)
       self.update_var('step', self.get_var('step') + 1)
-      mean_beta = 1. - apply_update * (1. - p.mean_beta)
+      mean_beta = 1.0 - apply_update * (1.0 - self.mean_beta)
       mean = mean_beta * mean + (1. - mean_beta) * self.inv_activation_fn(
           jnp.mean(inputs, axis=0, keepdims=True))
-    coefficients = jnp.zeros((inputs.shape[0], p.num_components),
-                             dtype=inputs.dtype)
+    coefficients = jnp.zeros(
+        (inputs.shape[0], self.num_components), dtype=inputs.dtype
+    )
     coefficients_momentum = jnp.zeros_like(coefficients)
     _, coefficients, _, _, _ = lax.while_loop(
         _iter_condition, _iter_body,
@@ -312,9 +314,10 @@ class BregmanPCA(base_layer.BaseLayer):
       components_grad_norm = jnp.maximum(jnp.linalg.norm(components_grad), 1e-6)
       components_grad = components_grad / components_grad_norm * jnp.sqrt(
           jnp.size(components_grad))
-      components_momentum = (p.components_beta * components_momentum) + (
-          1. - p.components_beta) * components_grad * apply_update
-      components -= base_lr * p.components_lr * components_momentum
+      components_momentum = (self.components_beta * components_momentum) + (
+          1.0 - self.components_beta
+      ) * components_grad * apply_update
+      components -= base_lr * self.components_lr * components_momentum
       self.update_var('mean', mean)
       self.update_var('components', components)
     bregman_loss = self.bregman_loss_fn(coefficients, components, mean, inputs)

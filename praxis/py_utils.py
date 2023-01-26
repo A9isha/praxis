@@ -19,6 +19,7 @@ import contextlib
 import dataclasses
 import functools
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
@@ -26,7 +27,6 @@ from absl import flags
 from absl import logging
 import flax
 import jax
-from jax import sharding
 from jax.experimental import global_device_array as gda_lib
 from jax.experimental import maps
 from jax.experimental import mesh_utils
@@ -34,16 +34,13 @@ from jax.experimental import multihost_utils
 from jax.experimental import pjit
 from jax.interpreters import pxla
 import jax.numpy as jnp
-from lingvo.core import cluster
-from lingvo.core import hyperparams
-from lingvo.core import py_utils
 import numpy as np
 import optax
+from praxis import lingvo_lib
 
 flags.DEFINE_bool(
     'pmap_use_tensorstore', False,
     'Temporary flag to allow pmap users to fall back to flax checkpointing.')
-
 
 # SeqIOInput enumeration provenance keys
 PROVENANCE_PREFIX = '_seqio_provenance'
@@ -58,24 +55,14 @@ def pmap_use_tensorstore():
   return flags.FLAGS.pmap_use_tensorstore
 
 
-infeed_context_scope = cluster.InfeedContextScope
-# No more symbols from lingvo cluster should be accessed by JAX library.
+current_cluster = lingvo_lib.current_cluster
+infeed_context_scope = lingvo_lib.infeed_context_scope
+TFDatasetSource = lingvo_lib.TFDatasetSource
 
-flatten = py_utils.Flatten
-NestedMap = py_utils.NestedMap
-MergeDictsWithValueCheck = py_utils.MergeDictsWithValueCheck
-ThreadLocalDict = py_utils.ThreadLocalDict
-ThreadLocalStack = py_utils.ThreadLocalStack
-fprop_dtype = py_utils.FPropDtype
-sharded_file_pattern_to_glob = py_utils.ShardedFilePatternToGlob
-# No more symbols from lingvo py_utils should be accessed by JAX library.
-del py_utils
+NestedMap = lingvo_lib.NestedMap
 
-InstantiableParams = hyperparams.InstantiableParams
-# Rename to HParams.
-HParams = hyperparams.Params
-# No more symbols from lingvo hyperparams should be accessed by JAX library.
-del hyperparams
+InstantiableParams = lingvo_lib.InstantiableParams
+HParams = lingvo_lib.HParams
 
 # No more imports from lingvo should be accessed by core JAX library.
 JTensor = jnp.ndarray
@@ -94,6 +81,41 @@ def _unzip2(xys):
 jax.tree_util.register_pytree_node(NestedMap,
                                    lambda xs: _unzip2(sorted(xs.items()))[::-1],
                                    lambda keys, xs: NestedMap(zip(keys, xs)))
+
+
+def merge_dict(dict1, dict2):
+  """Merges two dictionaries and asserts keys in both have identical values."""
+  for key in set(dict1) & set(dict2):
+    # The values must be the same object
+    if dict1[key] is not dict2[key]:
+      raise ValueError(
+          f'The same key {key} corresponds to different values '
+          f'in the dictionaries: {dict1[key]} vs {dict2[key]}.'
+      )
+  return {**dict1, **dict2}
+
+
+class ThreadLocalStack(threading.local):
+  """Stack of thread-local data."""
+
+  def __init__(self):
+    """Constructor."""
+    super().__init__()
+    self.stack = []
+
+
+def sharded_file_pattern_to_glob(file_pattern: str) -> str:
+  """Converts a file pattern path@shards in to path-?????-of-shards."""
+  if ',' in file_pattern:
+    raise ValueError(
+        'sharded_file_pattern_to_glob does not support multiple file patterns.'
+    )
+  if '@' not in file_pattern:
+    return file_pattern
+  path, shards = file_pattern.split('@')
+  if shards == '*':
+    return f'{path}-?????-of-*'
+  return f'{path}-?????-of-{int(shards):05}'
 
 
 def _nested_map_to_state_dict(xs: NestedMap) -> Dict[str, Any]:
@@ -125,6 +147,20 @@ def reshard(array: jnp.ndarray) -> np.ndarray:
 
 def unshard(array: jnp.ndarray) -> np.ndarray:
   """Undo the resharding to reshape away the local device count leading dim."""
+  return np.reshape(array, (-1,) + array.shape[2:])
+
+
+def reshape_with_outer_batch_size(array: jnp.ndarray,
+                                  outer_bs: int) -> np.ndarray:
+  """Reshapes an input tensor according to an outer batch size."""
+  batch_size = array.shape[0]
+  if batch_size // outer_bs < 1 or batch_size % outer_bs != 0:
+    raise ValueError('outer_bs should be a factor of batch_size.')
+  return np.reshape(array, (outer_bs, batch_size // outer_bs) + array.shape[1:])
+
+
+def combine_inner_and_outer_batches(array: jnp.ndarray) -> np.ndarray:
+  """Combines the first two dimensions of the array."""
   return np.reshape(array, (-1,) + array.shape[2:])
 
 
@@ -233,7 +269,8 @@ def extract_prefixed_keys_from_nested_map(
     left_separator: str = '[',
     right_separator: str = ']',
     is_leaf: Optional[Callable[[Any], bool]] = None) -> Any:
-  """Extracts a NestedMap with the nested prefix keys from its NestedMap node."""
+  """Extracts a NestedMap with the nested prefix keys from its NestedMap node.
+  """
   if is_leaf is not None and is_leaf(node):
     return None
   elif isinstance(node, dict):  # NestedMap inherits from dict.
@@ -294,9 +331,21 @@ def extract_prefixed_keys_from_nested_map(
   return prefix
 
 
+def is_mock_tpu_backend() -> bool:
+  """Checks if a mock TPU backend is detected.
+
+  Returns:
+    True if Mock TPU backend detected.
+  """
+  # Internal mock TPU checking implementation
+  return False
+
+
 def sync_global_devices(name: str) -> None:
   """Sync across all hosts/devices."""
-  # Internal mock TPU handling
+  if is_mock_tpu_backend():
+    return
+
   global_device_count = jax.device_count()
   logging.info('Starting sync_global_devices %s across %s devices globally',
                name, global_device_count)
@@ -352,19 +401,14 @@ def create_gda(host_arrays: Union[np.ndarray, Any],
     if jax.config.jax_array:
       # This is cached because creating new sharding objects everytime is
       # expensive in pjit dispatch path for inputs.
-      s = cached_mesh_pspec_sharding(global_mesh, pspec)
-      return jax.make_array_from_single_device_arrays(
-          global_shape.shape, s, dbs)
+      s = jax.sharding.NamedSharding(global_mesh, pspec)
+      return jax.make_array_from_single_device_arrays(global_shape.shape, s,
+                                                      dbs)
     else:
       return gda_lib.GlobalDeviceArray(global_shape.shape, global_mesh, pspec,
                                        dbs)
 
   return jax.tree_map(_gda_or_jax_array, global_shapes, pspecs, device_buffers)
-
-
-@functools.lru_cache()
-def cached_mesh_pspec_sharding(mesh, pspec):
-  return sharding.MeshPspecSharding(mesh, pspec)
 
 
 # TODO(b/248152817): Delete this function when jax.Array is enabled globally.
@@ -429,7 +473,7 @@ def convert_fully_replicated_array_to_pmap_array(arr):
         local_shape[0], local_shape[0], 1, None, sharded_aval, 0)
     device_buffers = arr.device_buffers  # pytype: disable=attribute-error
     devices = np.array([d.device() for d in device_buffers])
-    s = sharding.PmapSharding(devices, sharding_spec)
+    s = jax.sharding.PmapSharding(devices, sharding_spec)
     return jax.make_array_from_single_device_arrays(local_shape, s,
                                                     device_buffers)
 
@@ -457,7 +501,8 @@ def convert_host_local_array_to_global_array(arr):
   # pmap-produced Array has a "scrambled" device order.
   dbs = sorted(arr.device_buffers, key=lambda x: x.device().id)
   return jax.make_array_from_single_device_arrays(
-      global_shape, cached_mesh_pspec_sharding(mesh, partition_spec), dbs)
+      global_shape, jax.sharding.NamedSharding(mesh, partition_spec), dbs
+  )
 
 
 def get_global_input_shape_dtype(x: jnp.ndarray) -> jax.ShapeDtypeStruct:
@@ -558,7 +603,7 @@ def maybe_slice_uneven_sharding(x: JTensor, partition_spec: pjit.PartitionSpec,
     return x
   x = jax.lax.slice(x, [0] * x.ndim, shape)
   # Annotate after slice to make sure they have the same sharding. (Slice does
-  # not have the highest sharding propgation priority.)
+  # not have the highest sharding propagation priority.)
   return with_sharding_constraint(x, partition_spec)
 
 
@@ -664,8 +709,11 @@ def l2_normalize(x: JTensor, axis: int = -1, epsilon: float = 1e-12) -> JTensor:
   return x / norm
 
 
-def create_device_mesh(ici_mesh_shape: Sequence[int],
-                       dcn_mesh_shape: Optional[Sequence[int]] = None):
+def create_device_mesh(
+    ici_mesh_shape: Sequence[int],
+    dcn_mesh_shape: Optional[Sequence[int]] = None,
+    contiguous_submeshes: bool = False,
+):
   """Creates a single- or multi-slice device mesh from mesh shapes.
 
   Args:
@@ -673,6 +721,9 @@ def create_device_mesh(ici_mesh_shape: Sequence[int],
       multi-slice setting.
     dcn_mesh_shape: The mesh shape to use for between-slice parallelism. If
       None, creates a single-slice mesh.
+    contiguous_submeshes: If True, the mesh_utils.create_device_mesh() call will
+      attempt to create a mesh where each process's local devices form a
+      contiguous submesh. This is unused when `dcn_mesh_shape` is not None.
 
   Returns:
     An ndarray of JAX devices.
@@ -691,7 +742,9 @@ def create_device_mesh(ici_mesh_shape: Sequence[int],
         raise ValueError('Setting a nontrivial dcn_mesh_shape requires '
                          'multiple slices') from e
   else:
-    device_mesh = mesh_utils.create_device_mesh(ici_mesh_shape)
+    device_mesh = mesh_utils.create_device_mesh(
+        ici_mesh_shape, contiguous_submeshes=contiguous_submeshes
+    )
   logging.info('device_mesh: %s', device_mesh)
   return device_mesh
 
@@ -748,8 +801,8 @@ def tree_unstack(tree: Any, axis: int) -> Sequence[Any]:
   """Extracts an axis' dimension to the list dimension of the output.
 
   Args:
-    tree: PyTree which must have the above axis dimension with same size for
-      all leaf nodes. All leafs must be one of (np.ndarray, jnp.ndarray) types.
+    tree: PyTree which must have the above axis dimension with same size for all
+      leaf nodes. All leafs must be one of (np.ndarray, jnp.ndarray) types.
     axis: int, the axis to extract into the list dimension. All leafs in the
       pytree must have this dimension and must have the same shape.
 
@@ -780,8 +833,15 @@ def tree_unstack(tree: Any, axis: int) -> Sequence[Any]:
 def apply_padding(inputs: JTensor,
                   padding: JTensor,
                   pad_value: Optional[JTensor] = None,
-                  use_select: bool = True) -> JTensor:
+                  use_select: bool = True,
+                  axis: Optional[int] = None) -> JTensor:
   """Applies padding to a tensor.
+
+  `inputs` and `padding` should be broadcast compatible.
+
+  `axis` defines the leading dimensions along which to broadcast. Specifically,
+  `padding` is reshaped from [head|tail] -> [head|new_tail] such that the new
+  tail has the same rank as inputs' tail.
 
   Args:
     inputs: JTensor to apply padding to.
@@ -792,10 +852,16 @@ def apply_padding(inputs: JTensor,
       (True/default) or arithmetically (False). Some platforms have a
       sensitivity to one or the other and this is used to work around such
       issues.
+   axis: Optional axis from where broadcasting starts.
 
   Returns:
     A tensor with the same shape as x with padded values masked.
   """
+  if axis is not None:
+    head, tail = list(padding.shape[:axis]), list(padding.shape[axis:])
+    in_tail_len = len(inputs.shape[axis:])
+    ones = [1] * max(in_tail_len - len(tail), 0)
+    padding = jnp.reshape(padding, head + tail[:in_tail_len] + ones)
   if use_select:
     if pad_value is None:
       pad_value = jnp.zeros([], inputs.dtype)
@@ -853,10 +919,13 @@ def timeit(min_elapsed: float = 1e-6) -> Iterator[RunningPeriod]:
     period.end = time.time()
 
 
-def filter_by_matching_keys(batch: NestedMap,
-                            prefixes: Sequence[str] = ()) -> Tuple[
-                                NestedMap, NestedMap]:
+# We use Any types to allow nested data structures. They are defined in pytypes
+# which would cause a circular dependency.
+def filter_by_matching_keys(
+    batch: Any,
+    prefixes: Sequence[str] = ()) -> Tuple[NestedMap, NestedMap]:
   """Filter a map into one that matches any prefix and one that doesn't."""
+
   def _matching_fn(k: str) -> bool:
     for prefix in prefixes:
       if k.startswith(prefix):
@@ -864,8 +933,13 @@ def filter_by_matching_keys(batch: NestedMap,
 
     return False
 
-  matching = batch.FilterKeyVal(lambda k, _: _matching_fn(k))
-  non_matching = batch.FilterKeyVal(lambda k, _: not _matching_fn(k))
+  matching = NestedMap()
+  non_matching = NestedMap()
+  for k in batch.keys():
+    if _matching_fn(k):
+      matching[k] = batch[k]
+    else:
+      non_matching[k] = batch[k]
 
   return matching, non_matching
 
@@ -884,8 +958,9 @@ def get_enumeration_id(example: Dict[str, Any],
     a string represending the enumeration ID which should be globally unique
       within a given dataset. If enum fields DNE in example, returns None.
   """
-  if not all(k in example for k in (
-      INDEX_WITHIN_SHARD_KEY, SHARD_INDEX_KEY, NUM_SHARDS_KEY)):
+  if not all(
+      k in example
+      for k in (INDEX_WITHIN_SHARD_KEY, SHARD_INDEX_KEY, NUM_SHARDS_KEY)):
     return
 
   if pop:
@@ -896,4 +971,28 @@ def get_enumeration_id(example: Dict[str, Any],
   return (
       f'{INDEX_WITHIN_SHARD_KEY}={get_fn(example, INDEX_WITHIN_SHARD_KEY)}/'
       f'{SHARD_INDEX_KEY}={get_fn(example, SHARD_INDEX_KEY)}/'
-      f'{NUM_SHARDS_KEY}={get_fn(example, NUM_SHARDS_KEY)}')
+      f'{NUM_SHARDS_KEY}={get_fn(example, NUM_SHARDS_KEY)}'
+  )
+
+
+def pad_or_trim_to(x, shape, pad_val=0):
+  """Pad and slice x to the given shape.
+
+  Args:
+    x: A tensor.
+    shape: The shape of the returned tensor.
+    pad_val: An int or float used to pad x.
+
+  Returns:
+    'x' is padded with pad_val and sliced so that the result has the given
+    shape.
+  """
+  expected_rank = len(shape)
+  assert len(x.shape) == expected_rank, (x.shape, expected_rank)
+  padings = [
+      (0, pad_shape - min(orig_shape, pad_shape))
+      for orig_shape, pad_shape in zip(x.shape, shape)
+  ]
+  x = jnp.pad(x, padings, constant_values=pad_val)
+  x = jax.lax.slice(x, [0] * expected_rank, shape)
+  return jnp.reshape(x, shape)

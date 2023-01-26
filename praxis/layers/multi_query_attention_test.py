@@ -22,6 +22,7 @@ import jax
 from jax import numpy as jnp
 import numpy as np
 from praxis import base_layer
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import test_utils
 from praxis.layers import attentions
@@ -39,8 +40,12 @@ class MultiQueryAttentionTest(test_utils.TestCase):
     tf.random.set_seed(123)
 
   def test_one_headed_projection_shape(self):
-    test_layer_p = multi_query_attention.OneHeadedAttentionProjection.HParams(
-        name='mh', input_dim=16, output_dim=5)
+    test_layer_p = pax_fiddle.Config(
+        multi_query_attention.OneHeadedAttentionProjection,
+        name='mh',
+        input_dim=16,
+        output_dim=5,
+    )
     layer = instantiate(test_layer_p)
 
     inputs = np.random.normal(1.5, 2.0, [5, 16]).astype(np.float32)
@@ -55,9 +60,14 @@ class MultiQueryAttentionTest(test_utils.TestCase):
 
   @parameterized.parameters([False, True])
   def test_multi_query_attention_shape(self, use_rotary_position_emb):
-    test_layer_p = multi_query_attention.MultiQueryDotProductAttention.HParams(
-        name='mqa', input_dim=16, hidden_dim=60, num_heads=10,
-        use_rotary_position_emb=use_rotary_position_emb)
+    test_layer_p = pax_fiddle.Config(
+        multi_query_attention.MultiQueryDotProductAttention,
+        name='mqa',
+        input_dim=16,
+        hidden_dim=60,
+        num_heads=10,
+        use_rotary_position_emb=use_rotary_position_emb,
+    )
     layer = instantiate(test_layer_p)
     inputs = np.random.normal(1.5, 2.0, [5, 12, 16]).astype(np.float32)
     atten_mask = jnp.zeros([1, 1, 1, 12])
@@ -74,9 +84,14 @@ class MultiQueryAttentionTest(test_utils.TestCase):
 
   @parameterized.parameters([False, True])
   def test_multi_query_attention_decoding_shape(self, use_rotary_position_emb):
-    test_layer_p = multi_query_attention.MultiQueryDotProductAttention.HParams(
-        name='mqa', input_dim=16, hidden_dim=60, num_heads=10,
-        use_rotary_position_emb=use_rotary_position_emb)
+    test_layer_p = pax_fiddle.Config(
+        multi_query_attention.MultiQueryDotProductAttention,
+        name='mqa',
+        input_dim=16,
+        hidden_dim=60,
+        num_heads=10,
+        use_rotary_position_emb=use_rotary_position_emb,
+    )
     layer = instantiate(test_layer_p)
     prng_key = jax.random.PRNGKey(seed=123)
     prng_key, init_key = jax.random.split(prng_key)
@@ -94,8 +109,7 @@ class MultiQueryAttentionTest(test_utils.TestCase):
           query_vec,
           attentions.causal_mask(query_vec),
           mutable=[base_layer.DECODE_CACHE])
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
       encoded = layer.apply(
           updated_vars,
           method=layer.extend_step,
@@ -106,8 +120,13 @@ class MultiQueryAttentionTest(test_utils.TestCase):
     self.assertSequenceEqual(encoded.shape, [5, 16])
 
   def test_multi_query_attention_consistent(self):
-    test_layer_p = multi_query_attention.MultiQueryDotProductAttention.HParams(
-        name='mqa', input_dim=16, hidden_dim=50, num_heads=10)
+    test_layer_p = pax_fiddle.Config(
+        multi_query_attention.MultiQueryDotProductAttention,
+        name='mqa',
+        input_dim=16,
+        hidden_dim=50,
+        num_heads=10,
+    )
     layer = instantiate(test_layer_p)
 
     inputs = np.random.normal(1.5, 2.0, [5, 2, 16]).astype(np.float32)
@@ -130,8 +149,7 @@ class MultiQueryAttentionTest(test_utils.TestCase):
           attentions.causal_mask(zero_vec),
           method=layer.__call__,
           mutable=[base_layer.DECODE_CACHE])
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
       output = jnp.zeros_like(encoded)
       for t in range(inputs.shape[1]):
         e, a = layer.apply(
@@ -142,7 +160,7 @@ class MultiQueryAttentionTest(test_utils.TestCase):
             time_step=t,
             segment_pos=None,
             mutable=[base_layer.DECODE_CACHE])
-        updated_vars = py_utils.MergeDictsWithValueCheck(a, initial_vars)
+        updated_vars = py_utils.merge_dict(a, initial_vars)
         output = output.at[:, t, :].set(e)
     self.assertAllClose(encoded, output)
 

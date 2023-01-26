@@ -68,20 +68,16 @@ class CubedReLU(BaseActivation):
 
 
 class LeakyReLU(BaseActivation):
-  """Leaky ReLU activation layer."""
+  """Leaky ReLU activation layer.
 
-  class HParams(base_layer.BaseLayer.HParams):
-    """Associated hyperparams for this layer class.
-
-    Attributes:
-      negative_slope: Negative slope of LEAKY_RELU.
-    """
-    negative_slope: float = 0.01
+  Attributes:
+    negative_slope: Negative slope of LEAKY_RELU.
+  """
+  negative_slope: float = 0.01
 
   def __call__(self, inputs: JTensor) -> JTensor:
     """Applies the activation function."""
-    p = self.hparams
-    return jax.nn.leaky_relu(inputs, negative_slope=p.negative_slope)
+    return jax.nn.leaky_relu(inputs, negative_slope=self.negative_slope)
 
 
 class Sigmoid(BaseActivation):
@@ -101,21 +97,17 @@ class Tanh(BaseActivation):
 
 
 class GELU(BaseActivation):
-  """Gaussian Error Linear Unit (GELU) activation layer."""
+  """Gaussian Error Linear Unit (GELU) activation layer.
 
-  class HParams(base_layer.BaseLayer.HParams):
-    """Associated hyperparams for this layer class.
-
-    Attributes:
-      approximate: Whtether to use the approximate or exact formulation.
-    """
-    # By default `tf.nn.gelu` is exact.
-    approximate: bool = True
+  Attributes:
+    approximate: Whtether to use the approximate or exact formulation.
+  """
+  # By default `tf.nn.gelu` is exact.
+  approximate: bool = True
 
   def __call__(self, inputs: JTensor) -> JTensor:
     """Applies the activation function."""
-    p = self.hparams
-    return jax.nn.gelu(inputs, approximate=p.approximate)
+    return jax.nn.gelu(inputs, approximate=self.approximate)
 
 
 class SiLU(BaseActivation):

@@ -16,6 +16,7 @@
 """Unit tests for model."""
 
 from typing import Any
+from praxis import pax_fiddle
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -32,7 +33,6 @@ from praxis.layers import resnets
 from praxis.layers import transformer_models
 
 NestedMap = py_utils.NestedMap
-BaseHParams = base_layer.BaseLayer.HParams
 instantiate = base_layer.instantiate
 LanguageModelType = transformer_models.LanguageModelType
 JTensor = pytypes.JTensor
@@ -42,21 +42,18 @@ DECODE_CACHE = base_layer.DECODE_CACHE
 
 
 class MockLM(base_layer.BaseLayer):
+  """Mock l m.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      logits: results returned by extend_step(), of shape [max step, batch size,
-        vocab size].
-      model_type:
-    """
-    logits: Any = None
-    model_type: LanguageModelType = LanguageModelType.CAUSAL
+  Attributes:
+    logits: results returned by extend_step(), of shape [max step, batch size,
+      vocab size].
+    model_type:
+  """
+  logits: Any = None
+  model_type: LanguageModelType = LanguageModelType.CAUSAL
 
   def setup(self) -> None:
-    p = self.hparams
-    self._logits = jnp.array(p.logits, dtype=jnp.float32)
+    self._logits = jnp.array(self.logits, dtype=jnp.float32)
 
   def __call__(self, *args: Any, **kwargs: Any) -> None:
     self.put_variable(DECODE_CACHE, 'time_step', 0)
@@ -89,11 +86,13 @@ class LanguageModelTest(test_utils.TestCase):
                   logits,
                   input_batch,
                   model_type=LanguageModelType.CAUSAL):
-    p = models.LanguageModel.HParams(
+    p = pax_fiddle.Config(
+        models.LanguageModel,
         name='mock_lm',
         decoder_tpl=decoder_p.clone(),
-        lm_tpl=MockLM.HParams(logits=logits),
-        model_type=model_type)
+        lm_tpl=pax_fiddle.Config(MockLM, logits=logits),
+        model_type=model_type,
+    )
     lang_model = instantiate(p)
     theta = NestedMap(lm=NestedMap())
     # We fix seed to 9 to get the desired prefix lengths below.
@@ -110,11 +109,14 @@ class LanguageModelTest(test_utils.TestCase):
   @parameterized.named_parameters(('_with_eval_sample_weights', True),
                                   ('_without_eval_sample_weights', False))
   def test_fprop(self, apply_eval_sample_weights):
-    p = models.LanguageModel.HParams(
+    p = pax_fiddle.Config(
+        models.LanguageModel,
         name='LM',
-        lm_tpl=transformer_models.TransformerLm.HParams(
-            model_dims=3, vocab_size=5),
-        apply_eval_sample_weights=apply_eval_sample_weights)
+        lm_tpl=pax_fiddle.Config(
+            transformer_models.TransformerLm, model_dims=3, vocab_size=5
+        ),
+        apply_eval_sample_weights=apply_eval_sample_weights,
+    )
     stacked_transformer_tpl = p.lm_tpl.stacked_transformer_tpl
     stacked_transformer_tpl.model_dims = 3
     stacked_transformer_tpl.hidden_dims = 4 * 3
@@ -146,11 +148,14 @@ class LanguageModelTest(test_utils.TestCase):
       self.assertIn('eval_sample_weights', per_example_out)
 
   def test_fprop_eval_sample_weights(self):
-    p = models.LanguageModel.HParams(
+    p = pax_fiddle.Config(
+        models.LanguageModel,
         name='LM',
-        lm_tpl=transformer_models.TransformerLm.HParams(
-            model_dims=3, vocab_size=5),
-        apply_eval_sample_weights=True)
+        lm_tpl=pax_fiddle.Config(
+            transformer_models.TransformerLm, model_dims=3, vocab_size=5
+        ),
+        apply_eval_sample_weights=True,
+    )
     stacked_transformer_tpl = p.lm_tpl.stacked_transformer_tpl
     stacked_transformer_tpl.model_dims = 3
     stacked_transformer_tpl.hidden_dims = 4 * 3
@@ -222,7 +227,7 @@ class LanguageModelTest(test_utils.TestCase):
 
   @parameterized.parameters([True, False])
   def test_base_case(self, fprop_for_prefix):
-    p = models.LanguageModel.HParams().decoder_tpl
+    p = pax_fiddle.Config(models.LanguageModel).decoder_tpl
     p.seqlen = 3
     p.min_prefix_len = 1
     p.fprop_for_prefix = fprop_for_prefix
@@ -308,7 +313,7 @@ class LanguageModelTest(test_utils.TestCase):
 
   @parameterized.parameters([True, False])
   def test_prefix(self, fprop_for_prefix):
-    p = models.LanguageModel.HParams().decoder_tpl
+    p = pax_fiddle.Config(models.LanguageModel).decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 2
     p.fprop_for_prefix = fprop_for_prefix
@@ -355,7 +360,7 @@ class LanguageModelTest(test_utils.TestCase):
 
   @parameterized.parameters([True, False])
   def test_prefix_lm(self, fprop_for_prefix):
-    p = models.LanguageModel.HParams().decoder_tpl
+    p = pax_fiddle.Config(models.LanguageModel).decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 2
     p.fprop_for_prefix = fprop_for_prefix
@@ -403,7 +408,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[5]], dtype=np.int32))
 
   def test_eos_terminate(self):
-    p = models.LanguageModel.HParams().decoder_tpl
+    p = pax_fiddle.Config(models.LanguageModel).decoder_tpl
     p.seqlen = 6
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -432,7 +437,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[3]], dtype=np.int32))
 
   def test_eos_independent(self):
-    p = models.LanguageModel.HParams().decoder_tpl
+    p = pax_fiddle.Config(models.LanguageModel).decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -466,7 +471,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[3], [4]], dtype=np.int32))
 
   def test_prefix_and_eos(self):
-    p = models.LanguageModel.HParams().decoder_tpl
+    p = pax_fiddle.Config(models.LanguageModel).decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -512,7 +517,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[5], [4], [3]], dtype=np.int32))
 
   def test_prefix_and_eos_fprop_for_prefix(self):
-    p = models.LanguageModel.HParams().decoder_tpl
+    p = pax_fiddle.Config(models.LanguageModel).decoder_tpl
     p.seqlen = 7
     p.max_decode_steps = 4
     p.min_prefix_len = 0
@@ -563,7 +568,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[6], [4], [3]], dtype=np.int32))
 
   def test_prefix_has_eos(self):
-    p = models.LanguageModel.HParams().decoder_tpl
+    p = pax_fiddle.Config(models.LanguageModel).decoder_tpl
     p.seqlen = 4
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -599,7 +604,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[4], [4]], dtype=np.int32))
 
   def test_max_decode_steps(self):
-    p = models.LanguageModel.HParams().decoder_tpl
+    p = pax_fiddle.Config(models.LanguageModel).decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -707,16 +712,22 @@ class LanguageModelTest(test_utils.TestCase):
                     [[12, 3, 4, 2, 0], [12, 3, 4, 2, 0]],
                     [[20, 3, 2, 0, 0], [20, 3, 2, 0, 0]]],
                    dtype=np.int32))
+      self.assertArraysEqual(
+          results.decode_lengths,
+          np.array([[5, 5], [4, 4], [3, 3]], dtype=np.int32),
+      )
     else:
       # Gumbel noise will make some difference between samples.
       self.assertArraysEqual(
           results.output_ids,
-          np.array([[[11, 13, 3, 3, 4], [11, 13, 3, 3, 4]],
-                    [[12, 3, 4, 2, 0], [12, 3, 0, 2, 0]],
+          np.array([[[11, 13, 3, 3, 4], [11, 13, 0, 3, 4]],
+                    [[12, 3, 4, 2, 0], [12, 3, 4, 0, 0]],
                     [[20, 3, 2, 0, 0], [20, 3, 2, 0, 0]]],
                    dtype=np.int32))
-    self.assertArraysEqual(results.decode_lengths,
-                           np.array([[5, 5], [4, 4], [3, 3]], dtype=np.int32))
+      self.assertArraysEqual(
+          results.decode_lengths,
+          np.array([[5, 5], [4, 5], [3, 3]], dtype=np.int32),
+      )
 
   @parameterized.parameters(
       (1, False),
@@ -725,7 +736,7 @@ class LanguageModelTest(test_utils.TestCase):
       (2, True),
   )
   def test_sample_decoding_prefix_and_eos_fprop_for_prefix(
-      self, k, is_dynamic_temp):
+      self, k, is_dynamic_input):
     p = models.SampleDecoderHParams(
         fprop_for_prefix=True,
         seqlen=7,
@@ -734,6 +745,7 @@ class LanguageModelTest(test_utils.TestCase):
         eos_id=2,
         num_samples=2,
         k=k,
+        p=0.9,
         temperature=0.5)
     logits = [
         [
@@ -765,9 +777,17 @@ class LanguageModelTest(test_utils.TestCase):
         prefix_lengths=jnp.array([2, 1, 1], dtype=jnp.int32),
     )
 
-    if is_dynamic_temp:
+    if is_dynamic_input:
       # Test if JTensor type temperature could work.
       input_batch['temperature'] = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float32)
+      input_batch['stop_decode_steps'] = jnp.array([4, 4, 3], dtype=jnp.int32)
+      input_batch['per_example_top_p'] = jnp.array(
+          [0.9, 0.9, 0.9], dtype=jnp.float32
+      )
+      input_batch['per_example_top_k'] = jnp.array([2, 2, 2], dtype=jnp.int32)
+      input_batch['eos_id'] = jnp.array(
+          [[0, 2], [0, 2], [0, 2]], dtype=jnp.int32
+      )
 
     results = self._run_decode(p, sample_logits, input_batch)
 
@@ -784,16 +804,22 @@ class LanguageModelTest(test_utils.TestCase):
                     [[12, 3, 4, 2, 0, 0, 0], [12, 3, 4, 2, 0, 0, 0]],
                     [[20, 3, 2, 0, 0, 0, 0], [20, 3, 2, 0, 0, 0, 0]]],
                    dtype=np.int32))
+      self.assertArraysEqual(
+          results.decode_lengths,
+          np.array([[6, 6], [4, 4], [3, 3]], dtype=np.int32),
+      )
     else:
       # Gumbel noise will make some difference between samples.
       self.assertArraysEqual(
           results.output_ids,
-          np.array([[[11, 13, 4, 3, 3, 4, 0], [11, 13, 0, 3, 3, 4, 0]],
-                    [[12, 3, 4, 2, 0, 0, 0], [12, 3, 4, 2, 0, 0, 0]],
+          np.array([[[11, 13, 4, 3, 3, 4, 0], [11, 13, 4, 0, 3, 4, 0]],
+                    [[12, 3, 4, 2, 0, 0, 0], [12, 3, 4, 0, 0, 0, 0]],
                     [[20, 3, 2, 0, 0, 0, 0], [20, 3, 2, 0, 0, 0, 0]]],
                    dtype=np.int32))
-    self.assertArraysEqual(results.decode_lengths,
-                           np.array([[6, 6], [4, 4], [3, 3]], dtype=np.int32))
+      self.assertArraysEqual(
+          results.decode_lengths,
+          np.array([[6, 6], [4, 5], [3, 3]], dtype=np.int32),
+      )
 
   def test_sample_decoding_prefix_and_eos_sample_equal_one(self):
     p = models.SampleDecoderHParams(
@@ -840,10 +866,78 @@ class LanguageModelTest(test_utils.TestCase):
     # and continues until EOS is found.
     self.assertArraysEqual(
         results.output_ids,
-        np.array([[[11, 13, 3, 3, 4]], [[12, 3, 4, 2, 0]], [[20, 3, 2, 0, 0]]],
+        np.array([[[11, 13, 0, 3, 0]], [[12, 3, 4, 2, 0]], [[20, 3, 2, 0, 0]]],
                  dtype=np.int32))
     self.assertArraysEqual(results.decode_lengths,
                            np.array([[5], [4], [3]], dtype=np.int32))
+
+  def test_sample_decoding_multi_stop_tokens(self):
+    p = models.SampleDecoderHParams(
+        seqlen=7,
+        min_prefix_len=0,
+        eos_id=[1, 2],
+        num_samples=1,
+        k=2,
+        temperature=0.5,
+        fprop_for_prefix=True,
+        max_decode_steps=4,
+    )
+    logits = [
+        [
+            [0, 0, 0, 0, 1],
+            [0, 1, 0, 0, 0],
+            [0, 0, 0, 1, 0],  # argmax=[4, 1, 3]
+        ],
+        [
+            [0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 1],
+            [0, 0, 1, 0, 0],  # argmax=[1, 4, 2]
+        ],
+        [
+            [0, 0, 0, 1, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 0, 1, 0],  # argmax=[3, 2, 3]
+        ],
+        [
+            [0, 0, 0, 0, 1],
+            [0, 0, 0, 0, 1],
+            [0, 0, 0, 1, 0],  # argmax=[4, 4, 3]
+        ],
+    ]
+    input_batch = NestedMap(
+        ids=jnp.array(
+            [[11, 13, 15], [12, 14, 16], [20, 30, 40]], dtype=jnp.int32
+        ),
+        paddings=jnp.zeros(shape=(3, 3), dtype=jnp.float32),
+        prefix_lengths=jnp.array([2, 2, 1], dtype=jnp.int32),
+    )
+    results = self._run_decode(p, logits, input_batch)
+
+    self.assertArraysEqual(
+        results.output_ids,
+        np.array(
+            [
+                [[11, 13, 4, 0, 3, 0, 0]],
+                [[12, 14, 1, 0, 0, 0, 0]],
+                [[20, 3, 2, 0, 0, 0, 0]],
+            ],
+            dtype=np.int32,
+        ),
+    )
+    self.assertArraysEqual(
+        results.decode_lengths, np.array([[6], [3], [3]], dtype=np.int32)
+    )
+
+  def test_cf_guidance_unimplemented_exception(self):
+    p = models.SampleDecoderHParams(seqlen=5, cf_guidance_scale=2.0)
+    input_batch = NestedMap(
+        ids=jnp.array([[11, 13]], dtype=jnp.int32),
+        paddings=jnp.ones(shape=(1, 2), dtype=jnp.float32),
+    )
+
+    with self.assertRaisesRegex(NotImplementedError,
+                                'LanguageModel does not support guidance.'):
+      self._run_decode(p, [], input_batch)
 
 
 class ClassifierModelTest(test_utils.TestCase):
@@ -851,8 +945,11 @@ class ClassifierModelTest(test_utils.TestCase):
   @parameterized.parameters([2, 6])
   def test_fprop(self, num_classes: int):
 
-    p = models.ClassificationModel.HParams(
-        name='classifier', network_tpl=resnets.ResNet.HParamsResNet5())
+    p = pax_fiddle.Config(
+        models.ClassificationModel,
+        name='classifier',
+        network_tpl=resnets.ResNet.HParamsResNet5(),
+    )
     p.softmax_tpl.num_classes = num_classes
     p.softmax_tpl.input_dims = 16
 

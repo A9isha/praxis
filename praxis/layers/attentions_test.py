@@ -26,6 +26,7 @@ from lingvo.core import batch_major_attention
 import numpy as np
 from praxis import base_layer
 from praxis import decoder_utils
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import test_utils
 from praxis.layers import attentions
@@ -150,7 +151,6 @@ class BlockUtilsTest(test_utils.TestCase, parameterized.TestCase):
     self.assertAllClose(ref_padding, padding)
 
 
-
 class AttentionsTest(test_utils.TestCase):
 
   def setUp(self):
@@ -159,7 +159,9 @@ class AttentionsTest(test_utils.TestCase):
     tf.random.set_seed(123)
 
   def test_per_dim_scale(self):
-    test_layer_p = attentions.PerDimScale.HParams(name='scale', dim=4)
+    test_layer_p = pax_fiddle.Config(
+        attentions.PerDimScale, name='scale', dim=4
+    )
     layer = instantiate(test_layer_p)
     inputs = np.random.normal(1.5, 2.0, [5, 4]).astype(np.float32)
 
@@ -186,12 +188,14 @@ class AttentionsTest(test_utils.TestCase):
     self.assertAllClose(test_utils.to_np(jax_out), test_utils.to_np(tf_output2))
 
   def test_mhd_projection_01(self):
-    test_layer_p = attentions.AttentionProjection.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.AttentionProjection,
         name='mh',
         input_dim=16,
         num_heads=2,
         dim_per_head=5,
-        is_output_projection=False)
+        is_output_projection=False,
+    )
     layer = instantiate(test_layer_p)
     inputs = np.random.normal(1.5, 2.0, [5, 16]).astype(np.float32)
 
@@ -225,7 +229,8 @@ class AttentionsTest(test_utils.TestCase):
 
   @parameterized.parameters([False, True])
   def test_mhd_projection_02(self, use_nhd_shape):
-    test_layer_p = attentions.AttentionProjection.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.AttentionProjection,
         name='mh',
         input_dim=16,
         num_heads=2,
@@ -270,12 +275,14 @@ class AttentionsTest(test_utils.TestCase):
     self.assertAllClose(test_utils.to_np(jax_out), test_utils.to_np(tf_output2))
 
   def test_mhd_projection_var_stats(self):
-    test_layer_p = attentions.AttentionProjection.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.AttentionProjection,
         name='mh',
         input_dim=256,
         num_heads=16,
         dim_per_head=16,
-        is_output_projection=True)
+        is_output_projection=True,
+    )
     layer = instantiate(test_layer_p)
     inputs = np.random.normal(1.5, 2.0, [2, 16, 16]).astype(np.float32)
 
@@ -333,7 +340,8 @@ class AttentionsTest(test_utils.TestCase):
     mdl_dim = 16
     hidden_dim = 32
     num_heads = 4
-    test_layer_p = attentions.DotProductAttention.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.DotProductAttention,
         name='mh',
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
@@ -343,7 +351,8 @@ class AttentionsTest(test_utils.TestCase):
         combine_qkv=combine_qkv,
         dconv_qkv=dconv_qkv,
         dconv_kernel_size=dconv_kernel_size,
-        use_rotary_position_emb=use_rotary_position_emb)
+        use_rotary_position_emb=use_rotary_position_emb,
+    )
     layer = instantiate(test_layer_p)
     prng_key = jax.random.PRNGKey(seed=123)
     prng_key, init_key = jax.random.split(prng_key)
@@ -397,8 +406,7 @@ class AttentionsTest(test_utils.TestCase):
       decoder_output = jnp.zeros(
           shape=[target_max_length, target_batch_size, mdl_dim])
 
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
       for t in range(starting_index, target_max_length):
         encoded, attention_states = layer.apply(
             updated_vars,
@@ -408,8 +416,7 @@ class AttentionsTest(test_utils.TestCase):
             segment_pos=None,
             method=layer.extend_step,
             mutable=[base_layer.DECODE_CACHE])
-        updated_vars = py_utils.MergeDictsWithValueCheck(
-            attention_states, initial_vars)
+        updated_vars = py_utils.merge_dict(attention_states, initial_vars)
         decoder_output = decoder_output.at[t].set(encoded)
 
     decoder_output = decoder_output[starting_index:]
@@ -428,7 +435,8 @@ class AttentionsTest(test_utils.TestCase):
     mdl_dim = 16
     hidden_dim = 32
     num_heads = 4
-    test_layer_p = attentions.DotProductAttention.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.DotProductAttention,
         name='mh',
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
@@ -498,7 +506,8 @@ class AttentionsTest(test_utils.TestCase):
     mdl_dim = 16
     hidden_dim = 32
     num_heads = 4
-    test_layer_p = attentions.DotProductAttentionXL.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.DotProductAttentionXL,
         name='mh',
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
@@ -557,17 +566,19 @@ class AttentionsTest(test_utils.TestCase):
     self.assertAllClose(
         test_utils.to_np(jax_atten_prob), test_utils.to_np(tf_atten_prob))
 
-  def text_attention_xl_step(self):
+  def test_attention_xl_step(self):
     mdl_dim = 16
     hidden_dim = 32
     num_heads = 4
-    test_layer_p = DotProductAttentionXL.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.DotProductAttentionXL,
         name='mh',
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         rel_pos_emb_dim=10,
-        atten_logit_cap=20.0)
+        atten_logit_cap=20.0,
+    )
     layer = test_layer_p.Instantiate()
     prng_key = jax.random.PRNGKey(seed=123)
     prng_key, init_key = jax.random.split(prng_key)
@@ -617,8 +628,7 @@ class AttentionsTest(test_utils.TestCase):
       decoder_output = jnp.zeros(
           shape=[target_max_length, target_batch_size, mdl_dim])
 
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
       for t in range(starting_index, target_max_length):
         encoded, attention_states = layer.apply(
             updated_vars,
@@ -628,8 +638,7 @@ class AttentionsTest(test_utils.TestCase):
             segment_pos=None,
             method=layer.extend_step,
             mutable=[base_layer.DECODE_CACHE])
-        updated_vars = py_utils.MergeDictsWithValueCheck(
-            attention_states, initial_vars)
+        updated_vars = py_utils.merge_dict(attention_states, initial_vars)
         decoder_output = decoder_output.at[t].set(encoded)
 
     decoder_output = decoder_output[starting_index:]
@@ -651,7 +660,8 @@ class AttentionsTest(test_utils.TestCase):
     hidden_dim = 32
     num_heads = 4
     block_size = 4
-    test_layer_p = attentions.LocalSelfAttentionXL.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.LocalSelfAttentionXL,
         name='mh',
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
@@ -725,7 +735,8 @@ class AttentionsTest(test_utils.TestCase):
     mdl_dim = 16
     hidden_dim = 32
     num_heads = 4
-    test_layer_p = attentions.LocalSelfAttention.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.LocalSelfAttention,
         name='mh',
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
@@ -807,8 +818,12 @@ class AttentionsTest(test_utils.TestCase):
   )
   def test_causal_depthwise_conv1d(self, shape, kernel_size, axis, hidden_dims):
     inputs = np.random.normal(1.5, 2.0, shape).astype(np.float32)
-    p = attentions.CausalDepthwiseConv1D.HParams(
-        name='causal_dconv', kernel_size=kernel_size, hidden_dims=hidden_dims)
+    p = pax_fiddle.Config(
+        attentions.CausalDepthwiseConv1D,
+        name='causal_dconv',
+        kernel_size=kernel_size,
+        hidden_dims=hidden_dims,
+    )
     causal_dconv_layer = instantiate(p)
     prng_key = jax.random.PRNGKey(seed=123)
     prng_key, init_key = jax.random.split(prng_key)
@@ -835,8 +850,12 @@ class AttentionsTest(test_utils.TestCase):
   def test_causal_depthwise_conv1d_extend_step(self, shape, kernel_size, axis,
                                                hidden_dims):
     inputs = np.random.normal(1.5, 2.0, shape).astype(np.float32)
-    p = attentions.CausalDepthwiseConv1D.HParams(
-        name='causal_dconv', kernel_size=kernel_size, hidden_dims=hidden_dims)
+    p = pax_fiddle.Config(
+        attentions.CausalDepthwiseConv1D,
+        name='causal_dconv',
+        kernel_size=kernel_size,
+        hidden_dims=hidden_dims,
+    )
     causal_dconv_layer = instantiate(p)
     prng_key = jax.random.PRNGKey(seed=123)
     prng_key, init_key = jax.random.split(prng_key)
@@ -874,14 +893,18 @@ class AttentionsTest(test_utils.TestCase):
     mdl_dim = 16
     hidden_dim = 32
     num_heads = 4
-    test_layer_p = attentions.DotProductAttention.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.DotProductAttention,
         name='relative_attn',
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
-        relative_bias_tpl=attentions.RelativeBias.HParams(
+        relative_bias_tpl=pax_fiddle.Config(
+            attentions.RelativeBias,
             relative_attention_num_buckets=num_buckets,
-            relative_attention_max_distance=max_distance))
+            relative_attention_max_distance=max_distance,
+        ),
+    )
     layer = instantiate(test_layer_p)
     target_batch_size = 3
     source_max_length = 16
@@ -908,10 +931,12 @@ class AttentionsTest(test_utils.TestCase):
   def test_relative_bias_bidirectional_bucket(self):
     num_buckets = 8
     max_distance = 8
-    bias_p = attentions.RelativeBias.HParams(
+    bias_p = pax_fiddle.Config(
+        attentions.RelativeBias,
         relative_attention_num_buckets=num_buckets,
         relative_attention_max_distance=max_distance,
-        bidirectional=True)
+        bidirectional=True,
+    )
     bias_p.name = 'bias_layer'
     bias_layer = bias_p.Instantiate()
     relative_position = np.asarray([5, 2, 0, 12, -3, -1, -15, 1])
@@ -923,10 +948,12 @@ class AttentionsTest(test_utils.TestCase):
   def test_relative_bias_unidirectional_bucket(self):
     num_buckets = 4
     max_distance = 8
-    bias_p = attentions.RelativeBias.HParams(
+    bias_p = pax_fiddle.Config(
+        attentions.RelativeBias,
         relative_attention_num_buckets=num_buckets,
         relative_attention_max_distance=max_distance,
-        bidirectional=False)
+        bidirectional=False,
+    )
     bias_p.name = 'bias_layer'
     bias_layer = bias_p.Instantiate()
     relative_position = np.asarray([5, 2, 0, 12, -3, -1, -15])
@@ -941,14 +968,18 @@ class AttentionsTest(test_utils.TestCase):
     mdl_dim = 16
     hidden_dim = 32
     num_heads = 4
-    test_layer_p = attentions.DotProductAttention.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.DotProductAttention,
         name='relative_attn',
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
-        relative_bias_tpl=attentions.RelativeBias.HParams(
+        relative_bias_tpl=pax_fiddle.Config(
+            attentions.RelativeBias,
             relative_attention_num_buckets=num_buckets,
-            relative_attention_max_distance=max_distance))
+            relative_attention_max_distance=max_distance,
+        ),
+    )
     layer = instantiate(test_layer_p)
     target_batch_size = 2
     source_max_length = 8
@@ -976,8 +1007,7 @@ class AttentionsTest(test_utils.TestCase):
           segment_pos,
           method=layer.__call__,
           mutable=[base_layer.DECODE_CACHE])
-      initial_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      initial_vars = py_utils.merge_dict(attention_states, initial_vars)
       atten_output, _ = layer.apply(
           initial_vars,
           inputs[:, time_step, :],
@@ -992,11 +1022,13 @@ class AttentionsTest(test_utils.TestCase):
   @parameterized.parameters([(32, 128), (2, 8), (8, 32)])
   def test_relative_bias_layer(self, num_buckets, max_distance):
     num_heads = 4
-    test_layer_p = attentions.RelativeBias.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.RelativeBias,
         name='relative_bias',
         relative_attention_num_buckets=num_buckets,
         relative_attention_max_distance=max_distance,
-        num_heads=num_heads)
+        num_heads=num_heads,
+    )
     test_layer_p.use_length_as_position = False
     layer_raw = instantiate(test_layer_p)
     test_layer_p.use_length_as_position = True
@@ -1082,20 +1114,24 @@ class AttentionsTest(test_utils.TestCase):
     dim_per_head = 8
     num_heads = 8
     # Reference combine qkv projection layer.
-    ref_proj_p = attentions.CombinedQKVProjectionLayer.HParams(
-        name='ref',
-        input_dim=input_dim,
-        dim_per_head=dim_per_head,
-        num_heads=num_heads)
-    proj = instantiate(ref_proj_p)
-
-    # Combine attention dim combine qkv projection layer.
-    combine_proj_p = attentions.CombinedQKVProjectionLayer.HParams(
+    ref_proj_p = pax_fiddle.Config(
+        attentions.CombinedQKVProjectionLayer,
         name='ref',
         input_dim=input_dim,
         dim_per_head=dim_per_head,
         num_heads=num_heads,
-        attention_combine_dims=True)
+    )
+    proj = instantiate(ref_proj_p)
+
+    # Combine attention dim combine qkv projection layer.
+    combine_proj_p = pax_fiddle.Config(
+        attentions.CombinedQKVProjectionLayer,
+        name='ref',
+        input_dim=input_dim,
+        dim_per_head=dim_per_head,
+        num_heads=num_heads,
+        attention_combine_dims=True,
+    )
     combine_proj = instantiate(combine_proj_p)
 
     batch_size = 3
@@ -1179,8 +1215,7 @@ class AttentionsTest(test_utils.TestCase):
           method=layer.__call__,
           mutable=[base_layer.DECODE_CACHE])
 
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
       # Call extend step start from prefix_len.
       for t in range(prefix_len, target_max_length):
         encoded, attention_states = layer.apply(
@@ -1191,8 +1226,7 @@ class AttentionsTest(test_utils.TestCase):
             segment_pos=None,
             method=layer.extend_step,
             mutable=[base_layer.DECODE_CACHE])
-        updated_vars = py_utils.MergeDictsWithValueCheck(
-            attention_states, initial_vars)
+        updated_vars = py_utils.merge_dict(attention_states, initial_vars)
         logging.info('encoded: %s', encoded)
         logging.info('fprop_out[:, t, :]: %s', fprop_out[:, t, :])
         self.assertAllClose(fprop_out[:, t, :], encoded)
@@ -1254,8 +1288,7 @@ class AttentionsTest(test_utils.TestCase):
           prefix_atten_mask,
           method=layer.__call__,
           mutable=[base_layer.DECODE_CACHE])
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
 
       # First lazy broadcast.
       _, attention_states = layer.apply(
@@ -1264,8 +1297,7 @@ class AttentionsTest(test_utils.TestCase):
           suffix_length=suffix_1_len,
           method=layer.lazy_broadcast_prefix,
           mutable=[base_layer.DECODE_CACHE, base_layer.PREFIX_DECODE_CACHE])
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
 
       def _broadcast_sample(x, num_samples):
         return jnp.repeat(x, num_samples, axis=0)
@@ -1281,8 +1313,7 @@ class AttentionsTest(test_utils.TestCase):
             method=layer.extend_step,
             mutable=[base_layer.DECODE_CACHE])
         del updated_vars[base_layer.DECODE_CACHE]
-        updated_vars = py_utils.MergeDictsWithValueCheck(
-            attention_states, updated_vars)
+        updated_vars = py_utils.merge_dict(attention_states, updated_vars)
         encoded = jnp.reshape(encoded, (-1, 2) + encoded.shape[1:])
         # First sample.
         self.assertAllClose(fprop_out[:, t, :], encoded[:, 0])
@@ -1296,8 +1327,7 @@ class AttentionsTest(test_utils.TestCase):
           suffix_length=suffix_2_len,
           method=layer.lazy_broadcast_prefix,
           mutable=[base_layer.DECODE_CACHE, base_layer.PREFIX_DECODE_CACHE])
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
 
       # Call extend step start from prefix_len + suffix_1_len.
       for t in range(prefix_len + suffix_1_len, prefix_len + suffix_2_len):
@@ -1310,8 +1340,7 @@ class AttentionsTest(test_utils.TestCase):
             method=layer.extend_step,
             mutable=[base_layer.DECODE_CACHE])
         del updated_vars[base_layer.DECODE_CACHE]
-        updated_vars = py_utils.MergeDictsWithValueCheck(
-            attention_states, updated_vars)
+        updated_vars = py_utils.merge_dict(attention_states, updated_vars)
         encoded = jnp.reshape(encoded, (-1, 6) + encoded.shape[1:])
         for sample_id in range(6):
           self.assertAllClose(fprop_out[:, t, :], encoded[:, sample_id])
@@ -1368,8 +1397,7 @@ class AttentionsTest(test_utils.TestCase):
           prefix_atten_mask,
           method=layer.__call__,
           mutable=[base_layer.DECODE_CACHE])
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
 
       # First lazy broadcast.
       _, attention_states = layer.apply(
@@ -1378,8 +1406,7 @@ class AttentionsTest(test_utils.TestCase):
           suffix_length=source_max_length - prefix_len,
           method=layer.lazy_broadcast_prefix,
           mutable=[base_layer.DECODE_CACHE, base_layer.PREFIX_DECODE_CACHE])
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
 
       def _broadcast_sample(x, num_samples):
         return jnp.repeat(x, num_samples, axis=0)
@@ -1440,8 +1467,7 @@ class AttentionsTest(test_utils.TestCase):
           mutable=[base_layer.DECODE_CACHE])
       logging.info('attention_states: %s', attention_states)
 
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
 
       def _set_state(value):
         """Sets decode state as the value."""
@@ -1458,8 +1484,7 @@ class AttentionsTest(test_utils.TestCase):
           method=layer.transform_decode_state,
           mutable=[base_layer.DECODE_CACHE])
 
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
 
       # Second lazy broadcast.
       _, attention_states = layer.apply(
@@ -1468,8 +1493,7 @@ class AttentionsTest(test_utils.TestCase):
           suffix_length=suffix_len,
           method=layer.lazy_broadcast_prefix,
           mutable=[base_layer.DECODE_CACHE, base_layer.PREFIX_DECODE_CACHE])
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
 
       _, attention_states = layer.apply(
           updated_vars,
@@ -1478,8 +1502,7 @@ class AttentionsTest(test_utils.TestCase):
           mutable=[base_layer.DECODE_CACHE, base_layer.PREFIX_DECODE_CACHE])
 
       logging.info('attention_states: %s', attention_states)
-      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
-                                                       initial_vars)
+      updated_vars = py_utils.merge_dict(attention_states, initial_vars)
 
       max_prefix_len = 4
       decode_lengths = np.array([2, 3, 4, 5])
@@ -1516,13 +1539,15 @@ class AttentionsTest(test_utils.TestCase):
     mdl_dim = 16
     hidden_dim = 32
     num_heads = 4
-    test_layer_p = attentions.DotProductAttention.HParams(
+    test_layer_p = pax_fiddle.Config(
+        attentions.DotProductAttention,
         name='mh',
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         dim_per_head=16,
-        decode_cache=False)
+        decode_cache=False,
+    )
     layer = instantiate(test_layer_p)
     target_batch_size = 3
     source_max_length = 16

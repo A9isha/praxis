@@ -21,6 +21,7 @@ from flax import linen as nn
 import jax
 from jax import numpy as jnp
 from praxis import base_layer
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
 from praxis.layers import rnn_cell
@@ -28,8 +29,7 @@ from praxis.layers import rnn_cell
 NestedMap = py_utils.NestedMap
 
 JTensor = pytypes.JTensor
-
-BaseHParams = base_layer.BaseLayer.HParams
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 
 PARAMS = base_layer.PARAMS
 AUX_LOSS = base_layer.AUX_LOSS
@@ -46,21 +46,17 @@ def _sum_aux_loss(tree):
 
 
 class FRnn(base_layer.BaseLayer):
-  """A generic Rnn layer that works with any RnnCell."""
+  """A generic Rnn layer that works with any RnnCell.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      cell_tpl: Configs for the RnnCell.
-      reverse: Whether or not to unroll the sequence in reversed order.
-    """
-    cell_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
-    reverse: bool = False
+  Attributes:
+    cell_tpl: Configs for the RnnCell.
+    reverse: Whether or not to unroll the sequence in reversed order.
+  """
+  cell_tpl: Optional[LayerTpl] = base_layer.template_field(None)
+  reverse: bool = False
 
   def setup(self) -> None:
-    p = self.hparams
-    self.create_child('cell', p.cell_tpl)
+    self.create_child('cell', self.cell_tpl)
 
   def init_states(self, batch_size: int) -> NestedMap:
     return self.cell.init_states(batch_size)
@@ -102,7 +98,6 @@ class FRnn(base_layer.BaseLayer):
       act: A tensor of shape [batch, time, dims]. The output.
       state: Final state.
     """
-    p = self.hparams
     # Make a copy of the input structure to avoid side-effect.
     inputs = jax.tree_map(lambda x: x, inputs)
     assert isinstance(inputs, NestedMap)
@@ -110,7 +105,7 @@ class FRnn(base_layer.BaseLayer):
     assert hasattr(inputs, 'padding')
     assert isinstance(self.cell, rnn_cell.BaseRnnCell)
 
-    if p.reverse:
+    if self.reverse:
       inputs = jax.tree_map(lambda x: jnp.flip(x, axis=[1]), inputs)
 
     if not state0:
@@ -158,64 +153,51 @@ class FRnn(base_layer.BaseLayer):
 
     final_state, act = mapped_scan_fn(self.cell, state0, inputs)
 
-    if p.reverse:
+    if self.reverse:
       act = jnp.flip(act, axis=[1])
     return act, final_state
 
 
 class StackFrnn(base_layer.BaseLayer):
-  """A stacked FRNN which includes multiple layers."""
+  """A stacked FRNN which includes multiple layers.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      frnn_tpl: Configs for the frnn.
-      num_layers: number of frnn layers.
-      num_input_nodes: Number of input nodes.
-      num_output_nodes: Number of output nodes. If num_hidden_nodes is 0, also
-        used as cell size.
-    """
-    frnn_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
-    num_layers: int = 1
-    num_input_nodes: int = 0
-    num_output_nodes: int = 0
+  Attributes:
+    frnn_tpl: Configs for the frnn.
+    num_layers: number of frnn layers.
+    num_input_nodes: Number of input nodes.
+    num_output_nodes: Number of output nodes. If num_hidden_nodes is 0, also
+      used as cell size.
+  """
+  frnn_tpl: Optional[LayerTpl] = base_layer.template_field(None)
+  num_layers: int = 1
+  num_input_nodes: int = 0
+  num_output_nodes: int = 0
 
   def setup(self) -> None:
-    p = self.hparams
 
-    assert p.num_layers > 0
-    input_nodes = p.num_input_nodes
+    assert self.num_layers > 0
+    input_nodes = self.num_input_nodes
     frnns_p = []
-    for _ in range(p.num_layers):
-      frnn_p = p.frnn_tpl.clone()
+    for _ in range(self.num_layers):
+      frnn_p = self.frnn_tpl.clone()
       frnn_p.cell_tpl.set(
-          num_input_nodes=input_nodes, num_output_nodes=p.num_output_nodes)
+          num_input_nodes=input_nodes, num_output_nodes=self.num_output_nodes
+      )
       frnns_p.append(frnn_p)
-      input_nodes = p.num_output_nodes
+      input_nodes = self.num_output_nodes
 
     self.create_children('frnn', frnns_p)
 
-  @property
-  def num_input_nodes(self) -> int:
-    return self.hparams.num_input_nodes
-
-  @property
-  def num_output_nodes(self) -> int:
-    return self.hparams.num_output_nodes
-
   def init_states(self, batch_size: int) -> List[NestedMap]:
     return [
-        self.frnn[i].init_states(batch_size)
-        for i in range(self.hparams.num_layers)
+        self.frnn[i].init_states(batch_size) for i in range(self.num_layers)
     ]
 
   def extend_step(self, inputs: NestedMap,
                   state: List[NestedMap]) -> Tuple[List[NestedMap], JTensor]:
-    p = self.hparams
     inputs = jax.tree_map(lambda x: x, inputs)
     new_states = []
-    for i in range(p.num_layers):
+    for i in range(self.num_layers):
       new_state, act_i = self.frnn[i].extend_step(inputs, state[i])
       inputs.act = act_i
       new_states.append(new_state)
@@ -241,7 +223,6 @@ class StackFrnn(base_layer.BaseLayer):
       act: A tensor of [batch, time, dims]. The output.
       state: Final state.
     """
-    p = self.hparams
     inputs = jax.tree_map(lambda x: x, inputs)
 
     if not state0:
@@ -249,7 +230,7 @@ class StackFrnn(base_layer.BaseLayer):
       state0 = self.init_states(batch_size)
 
     final_states = []
-    for i in range(p.num_layers):
+    for i in range(self.num_layers):
       act_i, state = self.frnn[i](inputs=inputs, state0=state0[i])
       inputs.act = act_i
       final_states.append(state)
@@ -288,7 +269,6 @@ class LstmFrnn(FRnn):
       act: A tensor of [batch, time, dims]. The output.
       state: Final state.
     """
-    p = self.hparams
     # Make a copy of the inputs nested structure.
     inputs = jax.tree_map(lambda x: x, inputs)
     assert isinstance(self.cell, rnn_cell.BaseRnnCell)
@@ -299,7 +279,7 @@ class LstmFrnn(FRnn):
     # TODO(pax): support packed input.
     inputs.reset_mask = jnp.zeros_like(inputs.padding)
 
-    if p.reverse:
+    if self.reverse:
       inputs = jax.tree_map(lambda x: jnp.flip(x, axis=[1]), inputs)
 
     if not state0:
@@ -349,6 +329,6 @@ class LstmFrnn(FRnn):
 
     final_state, act = mapped_scan_fn(self.cell, state0, inputs)
 
-    if p.reverse:
+    if self.reverse:
       act = jnp.flip(act, axis=[1])
     return act, final_state

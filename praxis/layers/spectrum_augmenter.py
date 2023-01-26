@@ -26,43 +26,37 @@ from praxis import pytypes
 NestedMap = py_utils.NestedMap
 JTensor = pytypes.JTensor
 
-BaseHParams = base_layer.BaseLayer.HParams
-
 
 # TODO(nanxinchen): add time wrap and frequency wrap
 class SpectrumAugmenter(base_layer.BaseLayer):
   """Performs data augmentation as according to the SpecAug paper.
 
-    https://arxiv.org/pdf/1904.08779.pdf
+  https://arxiv.org/pdf/1904.08779.pdf
+
+  Attributes:
+    freq_mask_max_bins: Maximum number of frequency bins of frequency masking.
+    freq_mask_count: Number of times we apply masking on the frequency axis.
+    use_dynamic_time_mask_max_frames: If true, time_mask_max_frames is
+      determined by time_mask_max_ratio * utterance_length.
+    time_mask_max_frames: Maximum number of frames of time masking. Overridden
+      when use_dynamic_time_mask_max_frames = True.
+    time_mask_count: Number of times we apply masking on the time axis. Acts
+      as upper-bound when time_masks_per_frame > 0.
+    time_mask_max_ratio: Maximum portion allowed for time masking.
+    time_masks_per_frame: Ratio of number of time masks to be applied against
+      the number of frames. If > 0, multiplicity of the time mask is
+      determined by min(time_masks_per_frame * utterance_length,
+      time_mask_count).
+
+  TODO(hankliao): add augmentation policies from paper in HParam classmethods.
   """
-
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      freq_mask_max_bins: Maximum number of frequency bins of frequency masking.
-      freq_mask_count: Number of times we apply masking on the frequency axis.
-      use_dynamic_time_mask_max_frames: If true, time_mask_max_frames is
-        determined by time_mask_max_ratio * utterance_length.
-      time_mask_max_frames: Maximum number of frames of time masking. Overridden
-        when use_dynamic_time_mask_max_frames = True.
-      time_mask_count: Number of times we apply masking on the time axis. Acts
-        as upper-bound when time_masks_per_frame > 0.
-      time_mask_max_ratio: Maximum portion allowed for time masking.
-      time_masks_per_frame: Ratio of number of time masks to be applied against
-        the number of frames. If > 0, multiplicity of the time mask is
-        determined by min(time_masks_per_frame * utterance_length,
-        time_mask_count).
-
-    TODO(hankliao): add augmentation policies from paper in HParam classmethods.
-    """
-    freq_mask_max_bins: int = 27
-    freq_mask_count: int = 2
-    use_dynamic_time_mask_max_frames: bool = True
-    time_mask_max_frames: int = 40
-    time_mask_count: int = 10
-    time_mask_max_ratio: float = 0.05
-    time_masks_per_frame: float = 0.0
+  freq_mask_max_bins: int = 27
+  freq_mask_count: int = 2
+  use_dynamic_time_mask_max_frames: bool = True
+  time_mask_max_frames: int = 40
+  time_mask_count: int = 10
+  time_mask_max_ratio: float = 0.05
+  time_masks_per_frame: float = 0.0
 
   def _get_mask(self,
                 batch_size: int,
@@ -177,14 +171,13 @@ class SpectrumAugmenter(base_layer.BaseLayer):
     Returns:
       Inputs with random time masking applied.
     """
-    p = self.hparams
 
     # Get time masking parameters.
-    time_mask_max_frames = p.time_mask_max_frames
-    time_masks_per_frame = p.time_masks_per_frame
-    use_dynamic_time_mask_max_frames = p.use_dynamic_time_mask_max_frames
-    multiplicity = p.time_mask_count
-    max_ratio = p.time_mask_max_ratio
+    time_mask_max_frames = self.time_mask_max_frames
+    time_masks_per_frame = self.time_masks_per_frame
+    use_dynamic_time_mask_max_frames = self.use_dynamic_time_mask_max_frames
+    multiplicity = self.time_mask_count
+    max_ratio = self.time_mask_max_ratio
 
     # If maximum mask length is zero, do nothing.
     if ((time_mask_max_frames == 0 and not use_dynamic_time_mask_max_frames) or
@@ -222,11 +215,10 @@ class SpectrumAugmenter(base_layer.BaseLayer):
     Returns:
       Inputs with random frequency masking applied.
     """
-    p = self.hparams
 
     # Mask parameters.
-    freq_mask_max_bins = p.freq_mask_max_bins
-    multiplicity = p.freq_mask_count
+    freq_mask_max_bins = self.freq_mask_max_bins
+    multiplicity = self.freq_mask_count
 
     # If masking length or count is zero, do nothing.
     if freq_mask_max_bins == 0 or multiplicity == 0:

@@ -25,7 +25,7 @@ import functools
 import itertools
 import math
 import typing
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Type, TypeVar, Union, Mapping
 
 from absl import flags
 from absl import logging
@@ -61,14 +61,20 @@ BaseHyperParams = base_hyperparams.BaseHyperParams
 BaseParameterizable = base_hyperparams.BaseParameterizable
 InstantiableHyperParams = base_hyperparams.InstantiableHyperParams
 sub_config_field = base_hyperparams.sub_config_field
+template_field = pax_fiddle.template_field
+instance_field = pax_fiddle.instance_field
 
 Nested = pytypes.Nested
 NestedJTensor = pytypes.NestedJTensor
 NestedBool = pytypes.NestedBool
 NestedHParams = pytypes.NestedHParams
 NestedJTensorOrPartitionSpec = pytypes.NestedJTensorOrPartitionSpec
+NestedPartitionSpec = pytypes.NestedPartitionSpec
 
 SplitDimsMapping = pytypes.SplitDimsMapping
+
+AxisMetadata = flax_core.meta.AxisMetadata
+TAxisMetadata = flax_core.meta.TAxisMetadata
 
 # Layer stack to establish parent child relationships.
 _LAYER_STACK = py_utils.ThreadLocalStack()
@@ -171,11 +177,13 @@ def var_requires_sum_sync(var_hparams: ParamsT) -> bool:
 
 def var_disallow_bfloat16_conversion(var_hparams: ParamsT) -> bool:
   """Returns True if var_hparams excludes from bfloat16 conversion."""
-  return WeightHParamsCollection.DISALLOW_BFLOAT16_CONVERSION in var_hparams.collections
+  return (WeightHParamsCollection.DISALLOW_BFLOAT16_CONVERSION
+          in var_hparams.collections)
 
 
 def var_skip_lp_regularization(var_params: ParamsT) -> bool:
-  return WeightHParamsCollection.SKIP_LP_REGULARIZATION in var_params.collections
+  return (WeightHParamsCollection.SKIP_LP_REGULARIZATION
+          in var_params.collections)
 
 
 def to_partition_spec(split_dims_mapping: SplitDimsMapping,
@@ -279,6 +287,9 @@ def maybe_shard(x: JTensor,
   No sharding annotation is added if either split_dims_mapping is None or
   mesh_axis_names is None.
 
+  If mesh_axes_transpose exists in the current context, device axes will be
+  remapped according to the transpose rules.
+
   Args:
     x: the input tensor to be sharded.
     split_dims_mapping: A (nested) tuple of mesh axis to split x over. Below are
@@ -304,10 +315,26 @@ def maybe_shard(x: JTensor,
     return x
 
   assert len(x.shape) == len(split_dims_mapping), (
-      f'Invalid split_dims_mapping. Expected len(split_dims_mapping) '
+      'Invalid split_dims_mapping. Expected len(split_dims_mapping) '
       f'is {len(x.shape)}, while it is {len(split_dims_mapping)}. '
-      f'x.shape = {x.shape} and split_dims_mapping = {split_dims_mapping}')
+      f'x.shape = {x.shape} and split_dims_mapping = {split_dims_mapping}'
+  )
   partition_spec = to_partition_spec(split_dims_mapping, mesh_axis_names)
+
+  if JaxContext.has_context():
+    mapping = cur_jax_context().hparams.mesh_axes_transpose
+    if mapping:
+
+      def _transpose_one_dim(axes):
+        if axes is None:
+          return axes
+        if isinstance(axes, str):
+          return mapping.get(axes, axes)
+        return tuple([_transpose_one_dim(x) for x in axes])
+
+      partition_spec = pjit.PartitionSpec(
+          *[_transpose_one_dim(x) for x in partition_spec]
+      )
 
   if unconstrained_dims is not None:
     partition_spec_list = list(partition_spec)
@@ -328,101 +355,101 @@ class WeightInit(BaseHyperParams):
   method: str
   scale: float
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def Gaussian(scale: float = 1.0):
     """scale * jax.random.normal(0, 1.0)."""
     return WeightInit('gaussian', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def Uniform(scale: float = 1.0):
     """scale * jax.random.uniform(-1.0, 1.0)."""
     return WeightInit('uniform', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def Xavier(scale: float = 1.0):
     """Xavier initialization (x = sqrt(6. / (in + out)); [-x, x])."""
     return WeightInit('xavier', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def XavierWithFixupParams(scale: float = 1.0,
-                            depth: float = 1.0,
+      depth: float = 1.0,
                             layers_per_residual_block: float = 1.0):
     """Xavier initialization with Fixup."""
     scale = scale * math.pow(depth, (-1.0 / (2 * layers_per_residual_block)))
     return WeightInit('xavier', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def Constant(scale: float = 1.0):
     """scale."""
     return WeightInit('constant', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def TruncatedGaussian(scale: float = 1.0):
     """scale * jax.random.truncated_normal(-2.0, 2.0)."""
     return WeightInit('truncated_gaussian', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def GaussianSqrtDim(scale: float = 1.0):
     """scale * jax.random.normal(0, 1 / sqrt(dim0))."""
     return WeightInit('gaussian_sqrt_dim', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def GaussianSqrtFanIn(scale: float = 1.0):
     """scale * jax.random.normal(0, 1 / sqrt(fan_in))."""
     return WeightInit('gaussian_sqrt_fanin', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def GaussianSqrtFanOut(scale: float = 1.0):
     """scale * jax.random.normal(0, 1 / sqrt(fan_out))."""
     return WeightInit('gaussian_sqrt_fanout', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def GaussianSqrtFanAvg(scale: float = 1.0):
     """jax.random.normal(0, sqrt(2.0 / (in + out)))."""
     return WeightInit('gaussian_sqrt_fanavg', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def UniformSqrtDim(scale: float = 1.0):
     """scale * jax.random.uniform(-1 / sqrt(dim0), 1 / sqrt(dim0))."""
     return WeightInit('uniform_sqrt_dim', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def UniformUnitScaling(scale: float = 1.0):
     """scale * sqrt(3) / sqrt(dim0) * jax.random.uniform(-1, 1)."""
     return WeightInit('uniform_unit_scaling', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def TruncatedGaussianSqrtDim(scale: float = 1.0):
     """scale * jax.random.truncated_normal(0, 1 / sqrt(dim0))."""
     return WeightInit('truncated_gaussian_sqrt_dim', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def TruncatedGaussianSqrtFanIn(scale: float = 1.0):
     """scale * jax.random.truncated_normal(0, 1 / sqrt(fan_in))."""
     return WeightInit('truncated_gaussian_sqrt_fanin', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def TruncatedGaussianSqrtFanOut(scale: float = 1.0):
     """scale * jax.random.truncated_normal(0, 1 / sqrt(fan_out))."""
     return WeightInit('truncated_gaussian_sqrt_fanout', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def ScaledDeltaOrthogonal(scale: float = 1.0):
     return WeightInit('delta_orthogonal', scale)
 
@@ -481,7 +508,7 @@ class WeightHParams(BaseHyperParams):
   repeat_prefix: Optional[Sequence[int]] = None
   repeat_prefix_split_dims_mapping: SplitDimsMapping = None
 
-  # If any kwargs are None, they are given defaults from BaseLayer.hparams
+  # If any kwargs are None, they are given defaults from the parent BaseLayer
   # in self.create_variable.
   def __post_init__(self):
     if self.collections is None:
@@ -549,8 +576,9 @@ def scaled_delta_orthogonal(key: JTensor,
 
 
 # Caller ensures that `prng_key` is different for different init_var calls.
-def init_var(var_full_name: str, var_p: WeightHParams,
-             prng_key: PRNGKey) -> JTensor:
+def init_var(
+    var_p: WeightHParams, prng_key: PRNGKey, var_full_name: str
+) -> JTensor:
   """Creates an initial value of a var."""
   method = var_p.init.method
   scale = var_p.init.scale
@@ -575,7 +603,7 @@ def init_var(var_full_name: str, var_p: WeightHParams,
 
   if is_default_param_init(var_p.init):
     logging.debug(
-        'WARNING!!! var %s is using the default xavier initializer.'
+            'WARNING!!! var %s is using the default xavier initializer.'
         ' Make sure this is intended.', var_full_name)
 
   if method in ['delta_orthogonal']:
@@ -589,7 +617,7 @@ def init_var(var_full_name: str, var_p: WeightHParams,
       # This is probably not the right method to use when len(shape) > 2,
       # e.g. dim0 will be 3 with a 3x3 conv2d kernel.
       logging.warning(
-          'Initializing %s of shape %s with method %s: dim0=%s. '
+              'Initializing %s of shape %s with method %s: dim0=%s. '
           'Make sure that it is intended.', var_full_name, shape, method, dim0)
     scale *= 1.0 / math.sqrt(dim0)
   if method in ['gaussian_sqrt_fanin', 'truncated_gaussian_sqrt_fanin']:
@@ -646,20 +674,99 @@ def init_var(var_full_name: str, var_p: WeightHParams,
     assert False, 'init_type %s not supported.' % method
 
 
-# BoxedParam allows us to treat the actual variable jnp.array and its associated
-# metadata, i.e. WeightParam as a single Flax variable collection.
 @struct.dataclass
-class BoxedParam:
+class BoxedParam(struct.PyTreeNode, AxisMetadata):
+  """Boxed param with WeightHParam metadata.
+
+  BoxedParam allows us to treat the actual variable jnp.array and its
+  associated metadata, i.e. WeightHParam as a single Flax variable collection.
+  """
+
   # `value` is the jnp.array of the variable.
   value: Any
   # `meta` is the WeightParam declared for the variable.
   # We do not want to transform the variable weight param so we mark the field
   # pytree_node=False to prevent JAX transforms from touching it.
-  meta: Any = struct.field(pytree_node=False)
+  meta: WeightHParams = struct.field(pytree_node=False)
 
   def __post_init__(self):
     assert not isinstance(self.value,
                           BoxedParam), 'Cannot double-box a parameter!'
+
+  def unbox(self, apply_constraint=True) -> Any:
+    # Do not locally apply pjit.with_sharding_constraint.
+    del apply_constraint
+    return self.value
+
+  def replace_boxed(self, val: Any) -> TAxisMetadata:
+    return self.replace(value=val)
+
+  def add_axis(
+      self, index: int, metadata_params: Dict[Any, Any]
+  ) -> TAxisMetadata:
+    if index != 0:
+      raise ValueError('Only index==0 is implemented; given index=', index)
+    if not metadata_params['is_initializing']:
+      return self
+
+    x_times = metadata_params['x_times']
+    wp_sub = metadata_params['sub_weight_split_dims_mapping']
+    if wp_sub is not None:
+      assert isinstance(wp_sub, (list, tuple))
+      assert len(wp_sub) == 1
+      wp_sub = tuple(wp_sub)
+    else:
+      wp_sub = (-1,)
+
+    if self.meta.repeat_prefix:
+      assert isinstance(self.meta.repeat_prefix, list)
+      repeat_prefix = [x_times] + self.meta.repeat_prefix
+    else:
+      repeat_prefix = [x_times]
+
+    if self.meta.repeat_prefix_split_dims_mapping:
+      assert isinstance(self.meta.repeat_prefix_split_dims_mapping, tuple)
+      repeat_prefix_split_dims_mapping = wp_sub + tuple(
+          self.meta.repeat_prefix_split_dims_mapping
+      )
+    else:
+      repeat_prefix_split_dims_mapping = wp_sub
+
+    new_meta = copy.deepcopy(self.meta)
+    new_meta.repeat_prefix = repeat_prefix
+    new_meta.repeat_prefix_split_dims_mapping = repeat_prefix_split_dims_mapping
+    return self.replace(meta=new_meta)
+
+  def remove_axis(
+      self, index: int, metadata_params: Dict[Any, Any]
+  ) -> TAxisMetadata:
+    if index != 0:
+      raise ValueError('Only index==0 is implemented; given index=', index)
+    if not metadata_params['is_initializing']:
+      return self
+
+    x_times = metadata_params['x_times']
+    wp_sub = metadata_params['sub_weight_split_dims_mapping']
+    if wp_sub is not None:
+      assert isinstance(wp_sub, (list, tuple))
+      assert len(wp_sub) == 1
+      wp_sub = tuple(wp_sub)
+    else:
+      wp_sub = (-1,)
+
+    new_meta = copy.deepcopy(self.meta)
+    if new_meta.repeat_prefix:
+      assert isinstance(new_meta.repeat_prefix, list)
+      removed_axis = new_meta.repeat_prefix.pop(0)
+      assert removed_axis == x_times
+
+    if new_meta.repeat_prefix_split_dims_mapping:
+      assert isinstance(new_meta.repeat_prefix_split_dims_mapping, tuple)
+      updated_dims_mapping = list(new_meta.repeat_prefix_split_dims_mapping)
+      removed = updated_dims_mapping.pop(0)
+      assert (removed,) == tuple(wp_sub)
+      new_meta.repeat_prefix_split_dims_mapping = updated_dims_mapping
+    return self.replace(meta=new_meta)
 
 
 @struct.dataclass
@@ -696,6 +803,9 @@ class SummaryType(enum.Enum):
   IMAGE = 2
   TEXT = 5
   AUDIO = 6
+  # VIDEO summaries can be added to tensorboard using VideoSummaryMetric under
+  # pax multimodal metrics but not add_summary.
+  VIDEO = 7
 
   # Like SCALAR, but this type indicates that this data is suitable for use
   # with sensitive data.
@@ -796,15 +906,20 @@ class JaxContext:
     Attributes:
       do_eval: Whether to do eval.
       summary_verbosity: int, defines the verbosity level for summaries context.
-        The following are some notes on summary verbosity levels:
-        * The larger the verbosity value, the more verbose.
-        * The convention is to use non-negative integers.
-        * The default verbosity level at the context level is 3, meaning that
-          we'll log any summary written with verbosity <= 3 by default.
-        * Summaries are written if context_verbosity >= callsite_verbosity.
+        The following are some notes on summary verbosity levels: * The larger
+        the verbosity value, the more verbose. * The convention is to use
+        non-negative integers. * The default verbosity level at the context
+        level is 3, meaning that we'll log any summary written with verbosity <=
+        3 by default. * Summaries are written if context_verbosity >=
+        callsite_verbosity.
+      mesh_axes_transpose: Optional axes transpose rules for the device mesh. It
+        is a dict of {new_axis_name: old_axis_name}. Within this context,
+        new_axis_name in all shardings will be translated to old_axis_name in
+        the original device mesh.
     """
     do_eval: Optional[bool] = None
     summary_verbosity: int = 3
+    mesh_axes_transpose: Optional[Dict[str, str]] = None
 
   def __init__(self, hparams: JaxContext.HParams) -> None:
     self._hparams = hparams.clone()
@@ -990,8 +1105,7 @@ _BaseLayerRecursionDictKeysToIgnore = [
 ]
 
 
-def instantiate_layer(layer_p: Union[BaseLayer.HParams, pax_fiddle.Config],
-                      scope: Any) -> BaseLayer:
+def instantiate_layer(layer_p: pax_fiddle.Config, scope: Any) -> BaseLayer:
   """Instantiates a layer parameterized with layer_p.
 
   If a layer with the same shared_name exists under the scope 'scope', the
@@ -1013,7 +1127,7 @@ def instantiate_layer(layer_p: Union[BaseLayer.HParams, pax_fiddle.Config],
       assert compatible_hparams(
           pre_created.hparams,
           layer_p), (f'shared layers are of incompatible configs '
-                     f'\n\n{pre_created.hparams.to_text()} \n\n vs '
+          f'\n\n{pre_created.hparams.to_text()} \n\n vs '
                      f'\n\n {layer_p.to_text()}')
       # simply reuse existing layer.
       layer = pre_created.layer
@@ -1024,8 +1138,9 @@ def instantiate_layer(layer_p: Union[BaseLayer.HParams, pax_fiddle.Config],
       # created.
       wrapped_p = layer_p.clone()
       wrapped_p.shared_weight_layer_id = None
-      wrapper_p = _WrapperLayer.HParams(
-          name=layer_p.shared_weight_layer_id, cld=wrapped_p)
+      wrapper_p = pax_fiddle.Config(
+          _WrapperLayer, name=layer_p.shared_weight_layer_id, cld_tpl=wrapped_p
+      )
       wrapper = instantiate(wrapper_p, parent=scope)
       layer = wrapper.cld
       jax_context.set_shared_layer(scope, layer_p.shared_weight_layer_id,
@@ -1077,19 +1192,221 @@ def _weight_hparam_to_pspec(hparam, mesh_axis_names) -> BoxedPartitionSpec:
   return BoxedPartitionSpec(meta=to_partition_spec(mapping, mesh_axis_names))
 
 
-class BaseLayerApi(nn.Module):
-  """Common subclass for `BaseLayer` and `FiddleBaseLayer`.
+@dataclasses.dataclass(frozen=True)
+class _FiddleHParamsClassStub(
+    type, base_hyperparams.OverrideSubConfigFieldProtocol
+):
+  """Backwards-compatibility stub for `HParams` attribute in `BaseLayer`.
 
-  `BaseLayer` is used for layers that are configured using `HParams`.
-  `FiddleBaseLayer` is used for layers configured using `Fiddle`.
+  Can be used with base_hyperparams.sub_config_field.  E.g.:
+
+    >>> class MyLayer(base_layer.BaseLayer):
+    ...   bias_tpl: LayerTpl = sub_config_field(Bias.HParams)
+
+  Can be called to generate a `fdl.Config` for `fiddle_base_layer_cls`.  E.g.:
+
+    >>> bias_tpl = Bias.HParams(
+    ...     name='bias', dims=p.output_dims, bias_init=p.bias_init)
+
+  Can be used as type argument to `isinstance` -- returns true if the instance
+  is a `pax_fiddle.Config` whose `__fn_or_cls__` is `fiddle_base_layer_cls`:
+
+    >>> isinstance(pax_fiddle.Config(MyLayer), MyLayer.HParams)
+    True
+
+  TODO(b/249483164): Remove this stub once the HParams->Fiddle migration is
+  complete.
   """
+
+  fiddle_base_layer_cls: Type[BaseLayer]
+
+  def __new__(cls, fiddle_base_layer_cls, *args):
+    if args:
+      # The code in this block ensures that if the user does:
+      #   class Parent(BaseLayer):
+      #     x: int = 0
+      #   class Child(Parent):
+      #     class HParams(Parent.HParams):  # [*]
+      #       y: int = 0
+      # then an exception will be raised on the line marked with [*].
+      bases, cls_dict = args  # pylint: disable=unused-variable
+      assert len(bases) == 1, 'Expected HParams to have a single base'
+      base_cls = bases[0].fiddle_base_layer_cls
+      raise ValueError(
+          f'For {base_cls}: PAX layers should no longer use nested HParams '
+          'classes. Instead, add fields directly to the layer class.'
+      )
+    name = 'HParams'
+    qualname = f'{fiddle_base_layer_cls.__qualname__}.{name}'
+    namespace = {
+        '__qualname__': qualname,
+        'fiddle_base_layer_cls': fiddle_base_layer_cls,
+    }
+    bases = ()
+    # pylint: disable=unused-variable
+    return super().__new__(cls, name, bases, namespace)  # pytype: disable=wrong-arg-count
+
+  def __init__(cls, fiddle_base_layer_cls):
+    pass
+
+  def __instancecheck__(cls, instance):
+    return (
+        isinstance(instance, pax_fiddle.Config)
+        and isinstance(fdl.get_callable(instance), type)
+        and issubclass(fdl.get_callable(instance), cls.fiddle_base_layer_cls)
+    )
+
+  def __to_sub_config_field__(cls):
+    return template_field(cls.fiddle_base_layer_cls)
+
+  def __call__(cls, *args, **kwargs):
+    return pax_fiddle.Config(cls.fiddle_base_layer_cls, *args, **kwargs)
+
+  def config(cls, **kwargs):
+    return cls(**kwargs)
+
+
+class _FiddleHParamsClassStubDescriptor:
+  """Descriptor used to implement BaseLayer.HParams stub."""
+
+  def __get__(self, obj, objtype):
+    return _FiddleHParamsClassStub(objtype)
+
+
+class BaseLayer(nn.Module):
+  """Base class for layers that are configured using Fiddle.
+
+  Subclasses are expected to:
+
+  * Declare any configuration parameters using dataclass field syntax.
+  * Define a setup() method, which creates sub-layers and layer variables.
+  * Define a __call__() method, which carries out the ML computation.
+
+  TODO(pax-team): Add more doc-string and example.
+
+  Attributes:
+    dtype: Default dtype for all variables.
+    fprop_dtype: Activations datatype to use.
+    params_init: How model weights should be initialized.
+    skip_lp_regularization:  If True, all variables in this layer will skip Lp
+      regularization. If None/False, only variables explicitly in the
+      SKIP_LP_REGULARIZATION collection will skip Lp regularization. Also
+      propagated to child layers with default settings (None).
+    ici_mesh_shape: Shape of the logical mesh used for SPMD parallelism in each
+      slice. The meaning of each mesh axis is defined by mesh_axis_names, so
+      these two params must be the same length. If dcn_mesh_shape is present,
+      the overall mesh is the product of ici_mesh_shape and dcn_mesh_shape. For
+      example, an ici_mesh_shape of [2, 3, 4] with mesh_axis_names ['replica',
+      'data', 'mdl'] indicates 2-way replica parallelism, 3-way data
+      parallelism, and 4-way model parallelism over 24 devices. None, the
+      default, is equivalent to a sequence of ones and means that the model is
+      placed on a single device.
+    dcn_mesh_shape: Shape of the logical mesh used for SPMD parallelism over
+      multiple slices. The overall mesh is the product of ici_mesh_shape and
+      dcn_mesh_shape, and the meaning of each mesh axis is defined by
+      mesh_axis_names, so these three params must be the same length. For
+      example, a dcn_mesh_shape of [2, 2, 1, 1] with mesh_axis_names ['stage',
+      'replica', 'data', 'mdl'] indicates 2-way pipeline parallelism and 2-way
+      replica parallelism over 4 slices. None, the default, is equivalent to a
+      sequence of ones and means that the model is placed on a single slice.
+    contiguous_submeshes: If True, this will be passed to the
+      mesh_utils.create_device_mesh() call and it will attempt to create a mesh
+      where each process's local devices form a contiguous submesh. This is
+      unused when `dcn_mesh_shape` is not None.
+    mesh_axis_names: Names for each mesh axis in ici_mesh_shape and/or
+      dcn_mesh_shape. Common mesh axes include 'replica' for replica
+      parallelism, 'data' for data parallelism, 'mdl' for model parallelism, and
+      'stage' for pipeline parallelism.
+    weight_split_dims_mapping: Relevant only if the mesh shape params above are
+      not None. It specifies how weight of this layer or those of the sublayers
+      should be sharded over the overall device mesh. This field will be
+      dynamically bound to WeightSharding dataclass above.
+    activation_split_dims_mapping: Relevant only if the mesh shape params above
+      are not None. It specifies how activation of this layer or those of the
+      sublayers should be sharded over the overall device mesh. This field will
+      be dynamically bound to the ActivationSharding dataclass above.
+    shared_weight_layer_id: a unique id indicating weight sharing. Layers with
+      the same 'shared_weight_layer_id' share the same underlying model weights.
+  """
+
+  @dataclasses.dataclass(frozen=True)
+  class WeightSharding(pax_fiddle.CloneAndSetMixin):
+    """Represents how layer's learned parameters are partitioned across a mesh.
+
+    This usually refers to the primary model weight. Sub-layers can define
+    additional params for more weights.
+
+    Attributes:
+      wt: Sharding annotations for the primary model weight.
+    """
+
+    wt: SplitDimsMapping = None
+
+  @dataclasses.dataclass(frozen=True)
+  class ActivationSharding(pax_fiddle.CloneAndSetMixin):
+    """Represents how intermediate values should be partitioned across a mesh.
+
+    This usually refers to the primary layer output. Sub-layers can define
+    additional params for more activations.
+
+    Attributes:
+      out: Sharding annotations for the primary layer output.
+    """
+
+    out: SplitDimsMapping = None
+
+  dtype: jnp.dtype = jnp.float32
+  fprop_dtype: Optional[Any] = None
+  params_init: WeightInit = instance_field(default_param_init)
+  skip_lp_regularization: Optional[bool] = None
+  ici_mesh_shape: Optional[Sequence[int]] = None
+  dcn_mesh_shape: Optional[Sequence[int]] = None
+  contiguous_submeshes: bool = False
+  mesh_axis_names: Optional[Sequence[str]] = None
+  shared_weight_layer_id: Optional[str] = None
+  # TODO(b/249483164): Change these to use instance_field rather than
+  # template_field after the Fiddle migration.
+  weight_split_dims_mapping: pax_fiddle.Config[WeightSharding] = template_field(
+      WeightSharding
+  )
+  activation_split_dims_mapping: pax_fiddle.Config[
+      ActivationSharding
+  ] = template_field(ActivationSharding)
+
+  @property
+  def mesh_shape(self):
+    if self.ici_mesh_shape is not None:
+      assert len(self.ici_mesh_shape) == len(self.mesh_axis_names)
+    if self.dcn_mesh_shape is None:
+      return self.ici_mesh_shape
+    else:
+      assert len(self.ici_mesh_shape) == len(self.dcn_mesh_shape)
+      return [i * d for i, d in zip(self.ici_mesh_shape, self.dcn_mesh_shape)]
 
   # Fetches variables from flax 'params' class via theta "dot" syntax.
   theta = ThetaDescriptor()
 
+  def _to_fdl_config(self) -> pax_fiddle.Config[BaseLayer]:
+    """Returns a `fdl.Config` template for this BaseLayer."""
+    kwargs = {}
+    for field in dataclasses.fields(self):
+      if field.name == 'parent' or not field.init:
+        continue
+      value = getattr(self, field.name)
+      if isinstance(value, BaseLayer):
+        value = value.hparams
+      kwargs[field.name] = value
+    return pax_fiddle.Config(type(self), **kwargs)
+
+  # Compatibility stub:
+  # `self.hparams` returns a Fiddle Config that can be used to build self.
+  hparams = functools.cached_property(_to_fdl_config)
+
   @staticmethod
-  def copy_base_hparams(source: Union[BaseLayer.HParams, pax_fiddle.Config],
-                        target: Union[BaseLayer.HParams, pax_fiddle.Config]):
+  def copy_base_hparams(
+      source: Union[pax_fiddle.Config, BaseLayer],
+      target: pax_fiddle.Config,
+  ):
     """Copies BaseLayer configuration parameters from `source` to `target`.
 
     This is used by `self.create_child` to allow child layers to "inherit" these
@@ -1101,21 +1418,19 @@ class BaseLayerApi(nn.Module):
       source: The configuration object to copy parameters from.
       target: The configuration object to copy parameters to.  Mutated in-place.
     """
-    assert isinstance(source, (BaseLayer.HParams, pax_fiddle.Config,
-                               _FiddleHParamsInstanceStub)), source
-    assert isinstance(target, (BaseLayer.HParams, pax_fiddle.Config)), target
-    if isinstance(source, BaseLayer.HParams):
-      assert issubclass(source.cls, BaseLayer)
-    if isinstance(target, BaseLayer.HParams):
-      assert issubclass(target.cls, BaseLayer)
-    if isinstance(target, BaseLayer.HParams):
-      BaseLayerApi._copy_base_hparams(source, target)
-    else:
-      BaseLayerApi._copy_base_params_to_fdl_config(source, target)
+    assert isinstance(
+        source, (pax_fiddle.Config, BaseLayer)
+    ), source
+    assert isinstance(target, pax_fiddle.Config), target
+    if isinstance(source, pax_fiddle.Config):
+      assert issubclass(fdl.get_callable(source), BaseLayer)
+    assert issubclass(target.cls, BaseLayer)
+    BaseLayer._copy_base_params_to_fdl_config(source, target)
 
   @staticmethod
-  def _copy_base_hparams(source: Union[BaseLayer.HParams, pax_fiddle.Config],
-                         target: Union[BaseLayer.HParams, pax_fiddle.Config]):
+  def _copy_base_hparams(
+      source: Union[pax_fiddle.Config, BaseLayer], target: pax_fiddle.Config
+  ):
     if target.dtype == jnp.float32:
       target.dtype = source.dtype
     if target.fprop_dtype is None:
@@ -1137,29 +1452,27 @@ class BaseLayerApi(nn.Module):
       target.params_init = copy.deepcopy(source.params_init)
 
   @staticmethod
-  def _copy_base_params_to_fdl_config(source: Union[BaseLayer.HParams,
-                                                    pax_fiddle.Config],
-                                      target: pax_fiddle.Config):
-    # TODO(edloper): Once we start using `pax_fiddle.sub_field`, we will also
-    # need to copy base hparams to child objects in `pax_fiddle.build` (because
-    # create_child won't get called for those sub-fields).  But we *also* need
-    # to copy base hparams here -- e.g. to handle the case where a (non-fiddle)
-    # BaseLayer's child is a FiddleBaseLayer.
+  def _copy_base_params_to_fdl_config(
+      source: Union[pax_fiddle.Config, BaseLayer], target: pax_fiddle.Config
+  ):
+    # TODO(edloper): Once we start using `base_layer.instance_field`, we will
+    # also need to copy base hparams to child objects in `pax_fiddle.build`
+    # (because create_child won't get called for those sub-fields).
 
     # We copy from parent to child, then from child to grandchild, etc.  This
     # stack keeps track of the ancestors of `value` in `visit` (defined below).
     source_stack = [source]
 
     def visit(value, state: daglish.State) -> None:
-
-      # Copy params if `value` is a FiddleBaseLayer config.
-      value_is_base_layer = (
-          isinstance(value, pax_fiddle.Config) and
-          isinstance(fdl.get_callable(value), type) and
-          issubclass(fdl.get_callable(value), BaseLayerApi))
+      # Copy params if `value` is a BaseLayer config.
+      value_is_base_layer = isinstance(value, BaseLayer) or (
+          isinstance(value, pax_fiddle.Config)
+          and isinstance(fdl.get_callable(value), type)
+          and issubclass(fdl.get_callable(value), BaseLayer)
+      )
       if value_is_base_layer:
-        BaseLayerApi._copy_base_hparams(source_stack[-1], value)
-        source_stack.append(source)
+        BaseLayer._copy_base_hparams(source_stack[-1], value)
+        source_stack.append(value)
 
       # Recurse to child objects (skipping fields tagged "DoNotBuild").
       # We skip DoNotBuild objects, because those are child-templates, and
@@ -1189,16 +1502,37 @@ class BaseLayerApi(nn.Module):
     Args:
       *args: used for scan's rigid signature requirements.
     """
-    hparams = self.hparams.clone()
-    for p_name in self._hparam_fields:
-      p_value = getattr(hparams, p_name)
-      if (isinstance(
-          p_value,
-          (base_hyperparams.InstantiableHyperParams, pax_fiddle.Config)) and
-          issubclass(p_value.cls, BaseLayerApi)):
+
+    def is_sublayer_template(val):
+      template_types = (
+          base_hyperparams.InstantiableHyperParams,
+          pax_fiddle.Config,
+      )
+      if isinstance(val, template_types) and issubclass(val.cls, BaseLayer):
+        return True
+
+      # Check if val is a container of sub-layer templates.
+      if isinstance(val, Mapping) and all(isinstance(key, str) for key in val):
+        return is_sublayer_template(list(val.values()))
+      if isinstance(val, (list, tuple)):
+        if any(is_sublayer_template(child) for child in val):
+          if all(is_sublayer_template(child) or child is None for child in val):
+            return True
+      return False
+
+    hparam_kwargs = {}
+    for field in self._hparam_fields:
+      value = getattr(self, field)
+      if is_sublayer_template(value):
         # No need to include sub-layer template params, since the instantiated
         # sub-layer will show up in its own collection anyways.
-        setattr(hparams, p_name, None)
+        value = None
+      elif isinstance(value, BaseLayer):
+        pass  # Don't include child layers (instance_field).
+      else:
+        hparam_kwargs[field] = value
+    hparams = pax_fiddle.Config(type(self), **hparam_kwargs)
+
     self.put_variable(HYPER_PARAMS, '_hparams', WrappedHParams(hparams))
     # walk through all the attributes on self and recursively apply
     # post_init_hparams on submodules:
@@ -1207,19 +1541,99 @@ class BaseLayerApi(nn.Module):
         continue  # don't create recursion loop!
 
       def force(v):
-        if isinstance(v, BaseLayerApi):
+        if isinstance(v, BaseLayer):
           # pass dummy args through - again only needed for scan.
           v.post_init_hparams(*args)
 
       jax.tree_map(force, val)
     return None
 
-  @property
+  @functools.cached_property
   def _hparam_fields(self) -> Set[str]:
     """Returns a list of hyperparameter field names for `self`."""
-    raise ValueError(f'Abstract method {type(self)}._hparam_fields')
+    return set(field.name for field in dataclasses.fields(self)
+               if field.init and field.name != 'parent')
+
+  @classmethod
+  def __init_subclass__(cls, **kwargs: Any):
+    cls._override_split_dim_mapping_fields()
+    if 'HParams' in cls.__dict__:
+      raise ValueError(
+          f'For {cls}: PAX layers should no longer use nested HParams '
+          'classes. Instead, add fields directly to the layer class.'
+      )
+    super().__init_subclass__(**kwargs)
+    for field in dataclasses.fields(cls):
+      if isinstance(field.default, fdl.Buildable):
+        raise ValueError(
+            f"{cls.__qualname__}.{field.name}'s default value is a mutable "
+            'instance of fdl.Buildable.  Please update this field to use a '
+            'default_factory instead, to avoid unintentional object sharing.'
+        )
+      if _is_template_type(field.type) and not pax_fiddle.has_do_not_build_tag(
+          field
+      ):
+        raise ValueError(
+            f'{cls.__qualname__}.{field.name} has a template type, but '
+            'does not have the pax_fiddle.DoNotBuild tag set.  Please use '
+            'base_layer.template_field to declare this field.')
+
+  @classmethod
+  def _override_split_dim_mapping_fields(cls):
+    """Overrides the `*_split_dims_mapping` fields, if necessary.
+
+    If WeightSharding or ActivationSharding were overridden by
+    `cls`, then automatically transform them to a dataclass, and update the
+    corresponding dataclass fields to use the new type for their
+    default_factory.
+    """
+    if '__annotations__' not in cls.__dict__:
+      cls.__annotations__ = {}
+    if 'WeightSharding' in cls.__dict__:
+      if not issubclass(cls.WeightSharding, BaseLayer.WeightSharding):
+        raise ValueError(
+            f'Expected {cls}.WeightSharding to be a subclass of '
+            'BaseLayer.WeightSharding'
+        )
+      if not typing.TYPE_CHECKING:
+        dataclasses.dataclass(frozen=True)(cls.WeightSharding)
+      # TODO(b/249483164): Change this to use instance_field rather than
+      # template_field after the Fiddle migration.
+      cls.__annotations__['weight_split_dims_mapping'] = pax_fiddle.Config[
+          cls.WeightSharding
+      ]
+      cls.weight_split_dims_mapping = template_field(cls.WeightSharding)
+    if 'ActivationSharding' in cls.__dict__:
+      if not issubclass(cls.ActivationSharding, BaseLayer.ActivationSharding):
+        raise ValueError(
+            f'Expected {cls}.ActivationSharding to be a subclass of '
+            'BaseLayer.ActivationSharding'
+        )
+      if not typing.TYPE_CHECKING:
+        dataclasses.dataclass(frozen=True)(cls.ActivationSharding)
+      # TODO(b/249483164): Change this to use instance_field rather than
+      # template_field after the Fiddle migration.
+      cls.__annotations__['activation_split_dims_mapping'] = pax_fiddle.Config[
+          cls.ActivationSharding
+      ]
+      cls.activation_split_dims_mapping = template_field(cls.ActivationSharding)
 
   def __post_init__(self):
+    if isinstance(self.dtype, (BaseHyperParams, fdl.Config)):
+      type_name = f'{type(self).__module__}.{type(self).__qualname__}'
+      raise TypeError(
+          f'Expected first argument to {type_name} to be a dtype, '
+          f'but got a {type(self.dtype)} instead.  This can happen if '
+          f'you try to instantiate {type_name} using '
+          f'`{type_name}(layer_p)`, which is no longer supported for '
+          'Fiddle-configured layers.  Please use `layer_p.Instantiate()` '
+          'instead.'
+      )
+    # Note: we need to set fprop_dtype before we call super().__post_init__(),
+    # because super().__post_init__() can mark `self` as frozen in some
+    # contexts.
+    if self.fprop_dtype is None:
+      self.fprop_dtype = self.dtype
     object.__setattr__(self, '_theta', set())
     object.__setattr__(self, '_weight_hparams', {})
     object.__setattr__(self, '_private_children', {})
@@ -1233,12 +1647,7 @@ class BaseLayerApi(nn.Module):
     if setup_status_before != setup_status_after:
       # setup() is being called. Let's perform some sanity checks.
       for k, v in self._state.children.items():
-        if isinstance(v, BaseLayer):
-          if k not in self._private_children:
-            logging.warning(
-                'Child %s is not created via self.create_child helper, '
-                'possibly a shared layer.', k)
-        elif v == 'param':
+        if v == 'param':
           assert k in self._theta, (
               f'Learnable param {k} is not created via create_variable helper.')
         else:
@@ -1319,7 +1728,7 @@ class BaseLayerApi(nn.Module):
     with py_utils.logging_verbosity_level('FATAL'):
       context_p = JaxContext.HParams(do_eval=do_eval)
       with JaxContext.new_context(hparams=context_p):
-        if self.hparams.fprop_dtype == jnp.bfloat16:
+        if self.fprop_dtype == jnp.bfloat16:
           converted_args = jax.tree_map(_maybe_to_bfloat16_dtype, args)
           converted_kwargs = jax.tree_map(_maybe_to_bfloat16_dtype, kwargs)
         else:
@@ -1376,18 +1785,21 @@ class BaseLayerApi(nn.Module):
   @nn.nowrap
   def add_summary(self,
                   name: str,
-                  tensor: JTensor,
+                  tensor: Union[JTensor, Callable[[], JTensor]],
                   summary_type: SummaryType = SummaryType.SCALAR,
                   verbosity: int = 2) -> None:
     """Add a tensor to the SUMMARIES collection.
 
     Args:
       name: name of the summary to be collected.
-      tensor: the tensor containing the value to be written.
+      tensor: the tensor containing the value to be written or a
+        callable to evaluate to determine the value to be written.  A callable
+        can be used in situations where early evaluation of the tensor might
+        break specialized evaluation, e.g. jax2tf.
       summary_type: enum value indicating what type of summary is being added.
       verbosity: verbosity level of the summary being written. If this verbosity
         value is higher (less verbose) than that of the JaxContext the summary
-        will not be added. If the summary is being without any JaxConext, it'll
+        will not be added. If the summary is being without any JaxContext, it'll
         be added by default. Refer to JaxContext.HParams.summary_verbosity
         docstring for more detail.
     """
@@ -1395,6 +1807,9 @@ class BaseLayerApi(nn.Module):
     if (JaxContext.has_context() and
         verbosity > self.jax_context.summary_verbosity):
       return
+
+    if isinstance(tensor, Callable):
+      tensor = tensor()
 
     next_iter = 0
     summary_name = name
@@ -1557,28 +1972,29 @@ class BaseLayerApi(nn.Module):
     Returns:
       The newly created variable.
     """
-    p = self.hparams
-
-    if hasattr(p, name):
+    if hasattr(self, name):
       raise AttributeError(
-          f'{self.__class__}.HParams already has attribute {name}. '
-          'Please rename to avoid future name collision after Fiddle migration.'
-      )
+          f'{self.__class__} can not create a new variable named {name!r} '
+          'because it already has a field with that name.')
 
     var_hparams = var_hparams.clone()
 
     # If users did not specify init and dtype for var_hparams, fill in from
-    # self.hparams.
+    # self.
     if var_hparams.init is None:
-      var_hparams.init = p.params_init.clone()
+      var_hparams.init = self.params_init.clone()
     if var_hparams.dtype is None:
-      var_hparams.dtype = p.dtype
+      var_hparams.dtype = self.dtype
 
-    if p.mesh_shape is not None:
+    full_name = self.scope.path_text + '/' + name
+    if self.mesh_shape is not None:
       if (len([dim for dim in var_hparams.shape if dim > 1]) > 1 and
           var_hparams.tensor_split_dims_mapping is None):
-        logging.warning('tensor_split_dims_mapping missing for %s: shape=%s',
-                        self.scope.path_text + '/' + name, var_hparams.shape)
+        logging.warning(
+            'tensor_split_dims_mapping missing for %s: shape=%s',
+            full_name,
+            var_hparams.shape,
+        )
       if var_hparams.tensor_split_dims_mapping is not None:
         assert len(var_hparams.tensor_split_dims_mapping) == len(
             var_hparams.shape)
@@ -1586,7 +2002,7 @@ class BaseLayerApi(nn.Module):
     if var_hparams.collections is None:
       var_hparams.collections = []
 
-    if (p.skip_lp_regularization and
+    if (self.skip_lp_regularization and
         WeightHParamsCollection.SKIP_LP_REGULARIZATION
         not in var_hparams.collections):
       var_hparams.collections = var_hparams.collections + [
@@ -1605,7 +2021,7 @@ class BaseLayerApi(nn.Module):
     if trainable:
       # This is a param in Flax terminology.
       def _initializer_fn(prng_key: PRNGKey):
-        value = init_var(name, var_hparams, prng_key)
+        value = init_var(var_hparams, prng_key, full_name)
         return BoxedParam(value=value, meta=var_hparams)
 
       self.param(name, _initializer_fn)
@@ -1618,7 +2034,7 @@ class BaseLayerApi(nn.Module):
         # Use params rng stream to avoid having caller to provide one for
         # non-trainable variables.
         prng_key = self.make_rng(PARAMS)
-        value = init_var(name, var_hparams, prng_key)
+        value = init_var(var_hparams, prng_key, full_name)
         return BoxedParam(value=value, meta=var_hparams)
 
       # Non-trainable variables go into Flax nontrainable var collection.
@@ -1626,7 +2042,9 @@ class BaseLayerApi(nn.Module):
       return self.get_var(name)
 
   @nn.nowrap
-  def create_child(self, name: str, params: BaseLayer.HParams) -> BaseLayer:
+  def create_child(
+      self, name: str, params: pax_fiddle.Config[BaseLayerT]
+  ) -> BaseLayerT:
     """Creates a sub layer.
 
     The created sub layer can be accessed by `name`. E.g.::
@@ -1652,8 +2070,8 @@ class BaseLayerApi(nn.Module):
 
   @nn.nowrap
   def create_children(
-      self, name: str,
-      params: Sequence[BaseLayer.HParams]) -> Sequence[BaseLayer]:
+      self, name: str, params: Sequence[pax_fiddle.Config[BaseLayer]]
+  ) -> Sequence[BaseLayer]:
     """Creates a list of sub layers.
 
     The created sub layer list can be accessed by `name`. E.g.::
@@ -1678,13 +2096,14 @@ class BaseLayerApi(nn.Module):
     return children
 
   @nn.nowrap
-  def _create_child(self, name: str, params: BaseLayer.HParams) -> BaseLayer:
+  def _create_child(
+      self, name: str, params: pax_fiddle.Config[BaseLayer]
+  ) -> BaseLayer:
     """Creates and returns a child (w/o adding it as an attribute of `self`)."""
-    if not isinstance(params, (BaseLayer.HParams, pax_fiddle.Config,
-                               _FiddleHParamsInstanceStub)):
-      msg = ('Expected templates for `create_child` to be HParams or Fiddle '
-             f'Configs; got {type(params)}.')
-      if isinstance(params, BaseLayerApi):
+    if not isinstance(params, pax_fiddle.Config):
+      msg = ('Expected templates for `create_child` to be Fiddle Configs; got '
+             f'{type(params)}.')
+      if isinstance(params, BaseLayer):
         msg += (' This may be caused by a missing DoNotBuild tag on a field '
                 'that contains a Fiddle Config.')
       raise ValueError(msg + f'\nparams={params}')
@@ -1694,7 +2113,7 @@ class BaseLayerApi(nn.Module):
       )
 
     p = params.clone()
-    self.copy_base_hparams(self.hparams, p)  # mutates p in place.
+    self.copy_base_hparams(self, p)  # mutates p in place.
     p.name = name
     child = instantiate_layer(p, self.scope.root)
     self._private_children[name] = child
@@ -1705,10 +2124,8 @@ class BaseLayerApi(nn.Module):
     """Registers child creation with LayerRegistry."""
     if name in self._hparam_fields:
       raise AttributeError(
-          f'{self.__class__}.HParams has a field named {name!r}. We are '
-          'disallowing creating children of the same name, since those will '
-          'result in a name collision after Fiddle migration (which moves '
-          'HParams fields to root-level Flax module fields).')
+          f'{self.__class__} can not create a new child named {name!r} because '
+          f'it already has a field with that name.')
 
   @nn.nowrap
   def _cast_to_fprop_dtype(self, value: Any) -> Any:
@@ -1725,15 +2142,15 @@ class BaseLayerApi(nn.Module):
     return jax.tree_util.tree_map(_cast, value)
 
   def quantize_weight(self) -> NestedJTensor:
-    """Quantize the current layer and it's children layer(s).
+    """Quantize the current layer and its children layer(s).
 
     Returns:
       a nested map from names to quantized weights.
     """
     return self._quantize_fn(return_pspec=False)
 
-  def quantized_partitioned_specs(self) -> Any:
-    """Get quantization spec for the current layer and it's children layer(s).
+  def quantized_partition_specs(self) -> Any:
+    """Get quantization spec for the current layer and its children layer(s).
 
     Returns:
       a nested map from names to partition spec.
@@ -1741,7 +2158,7 @@ class BaseLayerApi(nn.Module):
     return self._quantize_fn(return_pspec=True)
 
   def _quantize_fn(self, return_pspec: bool) -> Union[NestedJTensor, Any]:
-    """quantize_weight() quantize the current layer and it's children layer(s).
+    """quantize_weight() quantize the current layer and its children layer(s).
 
     Quantization applies to only PARAMS and NON_TRAINABLE collection.
 
@@ -1766,7 +2183,7 @@ class BaseLayerApi(nn.Module):
     for name, child in self._private_children.items():
       # example child_res {'params': {a:{}, b:{}}, 'non-trainable':{a:{}}}
       if return_pspec:
-        child_res = child.quantized_partitioned_specs()
+        child_res = child.quantized_partition_specs()
       else:
         child_res = child.quantize_weight()
       for child_target in child_res:
@@ -1783,483 +2200,13 @@ class BaseLayerApi(nn.Module):
           res[target] = {}
         if return_pspec:
           var_val = _weight_hparam_to_pspec(self._weight_hparams[var_name],
-                                            self.hparams.mesh_axis_names)
+                                            self.mesh_axis_names)
         res[target][var_name] = var_val
     return res
-
-
-# Inherit from Flax Linen Module.
-class BaseLayer(
-    BaseParameterizable,
-    BaseLayerApi,
-    init_params_arg_name='_hparams',
-    nonconfigurable_init_arg_names=('name', 'parent')):
-  r"""Base class for all the layer object.
-
-  Subclasses are expected to override the following functions:
-
-  HParams(): Returns a configuration HParams for this layer.
-  setup(): To setup this instance, which includes create all the sub-layers, as
-    well as immediate layer variables.
-  __call__(): The main method that carries out ML computation.
-
-  TODO(pax-team): Add more doc-string and example.
-  """
-  # dataclass takes a single HParams object. This should not change during the
-  # lifetime of this layer.
-  _hparams: base_hyperparams.InstantiableHyperParams
-
-  class WeightShardingHParams(BaseHyperParams):
-    """Represents how layer's learned parameters are partitioned across a mesh.
-
-    This usually refers to the primary model weight. Sub-layers can define
-    additional params for more weights.
-
-    Attributes:
-      wt: Sharding annotations for the primary model weight.
-    """
-    wt: SplitDimsMapping = None
-
-  class ActivationShardingHParams(BaseHyperParams):
-    """Represents how intermediate values should be partitioned across a mesh.
-
-    This usually refers to the primary layer output. Sub-layers can define
-    additional params for more activations.
-
-    Attributes:
-      out: Sharding annotations for the primary layer output.
-    """
-    out: SplitDimsMapping = None
-
-  class HParams(InstantiableHyperParams):
-    """Hyperparameters for this layer.
-
-    Attributes:
-      dtype: Default dtype for all variables.
-      fprop_dtype: Activations datatype to use.
-      params_init: How model weights should be initialized.
-      skip_lp_regularization:  If True, all variables in this layer will skip Lp
-        regularization. If None/False, only variables explicitly in the
-        SKIP_LP_REGULARIZATION collection will skip Lp regularization. Also
-        propagated to child layers with default settings (None).
-      ici_mesh_shape: Shape of the logical mesh used for SPMD parallelism in
-        each slice. The meaning of each mesh axis is defined by mesh_axis_names,
-        so these two params must be the same length. If dcn_mesh_shape is
-        present, the overall mesh is the product of ici_mesh_shape and
-        dcn_mesh_shape. For example, an ici_mesh_shape of [2, 3, 4] with
-        mesh_axis_names ['replica', 'data', 'mdl'] indicates 2-way replica
-        parallelism, 3-way data parallelism, and 4-way model parallelism over 24
-        devices. None, the default, is equivalent to a sequence of ones and
-        means that the model is placed on a single device.
-      dcn_mesh_shape: Shape of the logical mesh used for SPMD parallelism over
-        multiple slices. The overall mesh is the product of ici_mesh_shape and
-        dcn_mesh_shape, and the meaning of each mesh axis is defined by
-        mesh_axis_names, so these three params must be the same length. For
-        example, a dcn_mesh_shape of [2, 2, 1, 1] with mesh_axis_names ['stage',
-        'replica', 'data', 'mdl'] indicates 2-way pipeline parallelism and 2-way
-        replica parallelism over 4 slices. None, the default, is equivalent to a
-        sequence of ones and means that the model is placed on a single slice.
-      mesh_axis_names: Names for each mesh axis in ici_mesh_shape and/or
-        dcn_mesh_shape. Common mesh axes include 'replica' for replica
-        parallelism, 'data' for data parallelism, 'mdl' for model parallelism,
-        and 'stage' for pipeline parallelism.
-      weight_split_dims_mapping: Relevant only if the mesh shape params above
-        are not None. It specifies how weight of this layer or those of the
-        sublayers should be sharded over the overall device mesh. This field
-        will be dynamically bound to WeightShardingHParams dataclass above.
-      activation_split_dims_mapping: Relevant only if the mesh shape params
-        above are not None. It specifies how activation of this layer or those
-        of the sublayers should be sharded over the overall device mesh. This
-        field will be dynamically bound to the ActivationShardingHParams
-        dataclass above.
-      shared_weight_layer_id: a unique id indicating weight sharing. Layers with
-        the same 'shared_weight_layer_id' share the same underlying model
-        weights.
-    """
-    dtype: jnp.dtype = jnp.float32
-    fprop_dtype: Optional[Any] = None
-    params_init: WeightInit = dataclasses.field(
-        default_factory=default_param_init)
-    skip_lp_regularization: Optional[bool] = None
-    ici_mesh_shape: Optional[Sequence[int]] = None
-    dcn_mesh_shape: Optional[Sequence[int]] = None
-    mesh_axis_names: Optional[Sequence[str]] = None
-    weight_split_dims_mapping: Optional[BaseHyperParams] = None
-    activation_split_dims_mapping: Optional[BaseHyperParams] = None
-    shared_weight_layer_id: Optional[str] = None
-
-    @property
-    def mesh_shape(self):
-      if self.ici_mesh_shape is not None:
-        assert len(self.ici_mesh_shape) == len(self.mesh_axis_names)
-      if self.dcn_mesh_shape is None:
-        return self.ici_mesh_shape
-      else:
-        assert len(self.ici_mesh_shape) == len(self.dcn_mesh_shape)
-        return [i * d for i, d in zip(self.ici_mesh_shape, self.dcn_mesh_shape)]
-
-    @classmethod
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-      # Skip registration, since we override it below.
-      super().__init_subclass__(__register_traverser__=False, **kwargs)
-
-  @classmethod
-  def __init_subclass__(cls, **kwargs: Any) -> None:
-    """Automatically initializes all subclasses as custom dataclasses."""
-    super().__init_subclass__(**kwargs)
-
-    # Update the Params to dynamically bind a few fields.
-    fields = [
-        ('_attribute_overrides', Tuple[str, ...],
-         ('cls', 'weight_split_dims_mapping', 'activation_split_dims_mapping')),
-        ('cls', Type[Any], cls),
-        ('weight_split_dims_mapping', BaseHyperParams,
-         cls.WeightShardingHParams()),
-        ('activation_split_dims_mapping', BaseHyperParams,
-         cls.ActivationShardingHParams()),
-    ]
-    cls.HParams = dataclasses.make_dataclass(
-        'HParams', fields=fields, bases=(cls.HParams,))  # pytype: disable=wrong-arg-types
-
-    # Set the module name and qualname of the HParams class, for more accurate
-    # serialization and debugging information.
-    cls.HParams.__module__ = cls.__module__
-    cls.HParams.__qualname__ = f'{cls.__name__}.HParams'
-
-    pax_fiddle._register_traversers_for_subclass(cls.HParams)  # pylint: disable=protected-access
-
-  @functools.cached_property
-  def _hparam_fields(self) -> Set[str]:
-    return set(field.name for field in dataclasses.fields(self.hparams))
-
-  def __post_init__(self):
-    if self._hparams.name:
-      object.__setattr__(self, 'name', self._hparams.name)
-    # We make a copy of the `_hparams` passed to __init__ the very first time in
-    # case `_hparams` refers to a shared params object that gets mutated by
-    # something outside this class.
-    # Note: self.hparams is a property defined on BaseParameterizable that
-    # returns self._hparams, which is why we set it like this.
-    object.__setattr__(self, '_hparams', self._hparams.clone())
-    assert isinstance(self._hparams, BaseLayer.HParams)
-    if self._hparams.fprop_dtype is None:  # pytype: disable=attribute-error
-      self._hparams.fprop_dtype = self._hparams.dtype  # pytype: disable=attribute-error
-    # Freeze the layer hparams. This is to prevent accidental config mutations
-    # that may lead to subtle bugs.
-    self._hparams.freeze()
-    super().__post_init__()
-
-  # linen.Module `adopt_attr_modules` sets `name` to None and clones the
-  # BaseLayer object expecting the `name` attribute to be None still. Yet
-  # BaesLayer.__post_init__ always overrides `name` attribute. Here we override
-  # `clone` to explicitly retain the original `name` attribute.
-  @nn.nowrap
-  def clone(self, *, parent=None, **updates):
-    oldname = self.name
-    retval = super().clone(parent=parent, **updates)
-    object.__setattr__(retval, 'name', oldname)
-    return retval
-
-  @property
-  def name(self) -> str:
-    assert self.hparams.name, (
-        f'{type(self).__name__} HParams must define the layer\'s "name"')
-    return self.hparams.name
-
-  @property
-  def fprop_dtype(self) -> Any:
-    return self.hparams.fprop_dtype
-
-
-@dataclasses.dataclass(frozen=True)
-class _FiddleHParamsClassStub(type,
-                              base_hyperparams.OverrideSubConfigFieldProtocol):
-  """Backwards-compatibility stub for `HParams` attribute in `FiddleBaseLayer`.
-
-  Can be used with base_hyperparams.sub_config_field.  E.g.:
-
-    >>> class MyLayer(base_layer.BaseLayer):
-    ...   class HParams(BaseHParams):
-    ...     bias_tpl: BaseHParams = sub_config_field(Bias.HParams)
-
-  Can be called to generate a `fdl.Config` for `fiddle_base_layer_cls`.  E.g.:
-
-    >>> bias_tpl = Bias.HParams(
-    ...     name='bias', dims=p.output_dims, bias_init=p.bias_init)
-
-  Can be used as type argument to `isinstance` -- returns true if the instance
-  is a `pax_fiddle.Config` whose `__fn_or_cls__` is `fiddle_base_layer_cls`:
-
-    >>> isinstance(pax_fiddle.Config(MyLayer), MyLayer.HParams)
-    True
-
-  TODO(b/249483164): Remove this stub once the HParams->Fiddle migration is
-  complete.
-  """
-  fiddle_base_layer_cls: Type[FiddleBaseLayer]
-
-  def __new__(cls, fiddle_base_layer_cls, *args):
-    if args:
-      # The code in this block ensures that if the user does:
-      #   class Parent(FiddleBaseLayer):
-      #     x: int = 0
-      #   class Child(Parent):
-      #     class HParams(Parent.HParams):  # [*]
-      #       y: int = 0
-      # then an exception will be raised on the line marked with [*].
-      bases, cls_dict = args  # pylint: disable=unused-variable
-      assert len(bases) == 1, 'Expected HParams to have a single base'
-      base_cls = bases[0].fiddle_base_layer_cls
-      raise ValueError(
-          f'{base_cls} was converted to a `FiddleBaseLayer`, but this '
-          'subclass was not converted.  To fix, convert this subclass to a '
-          '`FiddleBaseLayer`.')
-    name = 'HParams'
-    qualname = f'{fiddle_base_layer_cls.__qualname__}.{name}'
-    namespace = {'__qualname__': qualname,
-                 'fiddle_base_layer_cls': fiddle_base_layer_cls}
-    bases = ()
-    # pylint: disable=unused-variable
-    return super().__new__(cls, name, bases, namespace)  # pytype: disable=wrong-arg-count
-
-  def __init__(cls, fiddle_base_layer_cls):
-    pass
-
-  def __instancecheck__(cls, instance):
-    return (isinstance(instance, pax_fiddle.Config) and
-            isinstance(fdl.get_callable(instance), type) and
-            issubclass(fdl.get_callable(instance), cls.fiddle_base_layer_cls))
-
-  def __to_sub_config_field__(cls):
-    return pax_fiddle.template_field(cls.fiddle_base_layer_cls)
-
-  def __call__(cls, *args, **kwargs):
-    return pax_fiddle.Config(cls.fiddle_base_layer_cls, *args, **kwargs)
-
-  def config(cls, **kwargs):
-    return cls(**kwargs)
-
-
-class _FiddleHParamsClassStubDescriptor:
-  """Descriptor used to implement FiddleBaseLayer.HParams stub."""
-
-  def __get__(self, obj, objtype):
-    return _FiddleHParamsClassStub(objtype)
-
-
-class _FiddleHParamsInstanceStub:
-  """Backwards-compatibility stub for `hparams` attribute in `FiddleBaseLayer`.
-
-  Can be used to read attributes (e.g. `my_layer.hparams.dtype`).
-
-  Can be cloned to generate a `fdl.Config` object (`my_layer.hparams.clone()`).
-
-  TODO(b/249483164): Remove this stub once the HParams->Fiddle migration is
-  complete.
-  """
-
-  def __init__(self, base_layer: FiddleBaseLayer):
-    self._base_layer = base_layer
-
-  def __getattr__(self, name):
-    if '_base_layer' not in self.__dict__:
-      # `copy.copy` bypasses the constructor, so it's possible to have a
-      # _FiddleHParamsInstanceStub that doesn't have a _base_layer yet.
-      raise AttributeError(f'{self} has no attribute {name!r}')
-    if name not in self._base_layer._hparam_fields or name == 'parent':
-      raise AttributeError(
-          f'{type(self._base_layer)}.HParams has no attribute {name!r}')
-    value = getattr(self._base_layer, name)
-    if isinstance(value, BaseLayerApi):
-      value = value.hparams
-    return value
-
-  @property
-  def mesh_shape(self):
-    return self._base_layer.mesh_shape
-
-  def clone(self):
-    """Returns a fdl.Config for the wrapped FiddleBaseLayer.
-
-    Does not include child layers.
-    """
-    kwargs = {}
-    for field in dataclasses.fields(self._base_layer):
-      if field.name == 'parent' or not field.init:
-        continue
-      value = getattr(self._base_layer, field.name)
-      if isinstance(value, BaseLayerApi):
-        continue  # For now all children are built by setup().
-      kwargs[field.name] = value
-    return pax_fiddle.Config(type(self._base_layer), **kwargs)
-
-  @property
-  def cls(self):
-    return type(self._base_layer)
-
-  def to_text(self, include_types: bool = False, separator: str = ':'):
-    return base_hyperparams.nested_struct_to_text(
-        self.clone(), include_types, separator)
-
-
-class FiddleBaseLayer(BaseLayerApi):
-  """Base class for layers that are configured using Fiddle.
-
-  Subclasses are expected to:
-
-  * Declare any configuration parameters using dataclass field syntax.
-  * Define a setup() method, which creates sub-layers and layer variables.
-  * Define a __call__() method, which carries out the ML computation.
-
-  TODO(pax-team): Add more doc-string and example.
-  """
-
-  # TODO(b/249483164): Remove the `HParams` suffix from this type name once the
-  # initial HParams->Fiddle migration is complete.
-  @dataclasses.dataclass(frozen=True)
-  class WeightShardingHParams(pax_fiddle.CloneAndSetMixin):
-    """Represents how layer's learned parameters are partitioned across a mesh.
-
-    This usually refers to the primary model weight. Sub-layers can define
-    additional params for more weights.
-
-    Attributes:
-      wt: Sharding annotations for the primary model weight.
-    """
-    wt: SplitDimsMapping = None
-
-  # TODO(b/249483164): Remove the `HParams` suffix from this type name once the
-  # initial HParams->Fiddle migration is complete.
-  @dataclasses.dataclass(frozen=True)
-  class ActivationShardingHParams(pax_fiddle.CloneAndSetMixin):
-    """Represents how intermediate values should be partitioned across a mesh.
-
-    This usually refers to the primary layer output. Sub-layers can define
-    additional params for more activations.
-
-    Attributes:
-      out: Sharding annotations for the primary layer output.
-    """
-    out: SplitDimsMapping = None
-
-
-  # The following configuration fields correspond 1:1 with BaseLayer.HParams.
-  dtype: jnp.dtype = jnp.float32
-  fprop_dtype: Optional[Any] = None
-  params_init: WeightInit = pax_fiddle.sub_field(default_param_init)
-  skip_lp_regularization: Optional[bool] = None
-  ici_mesh_shape: Optional[Sequence[int]] = None
-  dcn_mesh_shape: Optional[Sequence[int]] = None
-  mesh_axis_names: Optional[Sequence[str]] = None
-  shared_weight_layer_id: Optional[str] = None
-  # TODO(b/249483164): Change these to use sub_field rather than template_field
-  # after the Fiddle migration.
-  weight_split_dims_mapping: pax_fiddle.Config[WeightShardingHParams] = (
-      pax_fiddle.template_field(WeightShardingHParams))
-  activation_split_dims_mapping: pax_fiddle.Config[
-      ActivationShardingHParams] = (
-          pax_fiddle.template_field(ActivationShardingHParams))
-
-  @property
-  def mesh_shape(self):
-    if self.ici_mesh_shape is not None:
-      assert len(self.ici_mesh_shape) == len(self.mesh_axis_names)
-    if self.dcn_mesh_shape is None:
-      return self.ici_mesh_shape
-    else:
-      assert len(self.ici_mesh_shape) == len(self.dcn_mesh_shape)
-      return [i * d for i, d in zip(self.ici_mesh_shape, self.dcn_mesh_shape)]
-
-  def __post_init__(self):
-    if isinstance(self.dtype, (BaseHyperParams, fdl.Config)):
-      type_name = f'{type(self).__module__}.{type(self).__qualname__}'
-      raise TypeError(
-          f'Expected first argument to {type_name} to be a dtype, '
-          f'but got a {type(self.dtype)} instead.  This can happen if '
-          f'you try to instantiate {type_name} using '
-          f'`{type_name}(layer_p)`, which is no longer supported for '
-          'Fiddle-configured layers.  Please use `layer_p.Instantiate()` '
-          'instead.')
-    # Note: we need to set fprop_dtype before we call super().__post_init__(),
-    # because super().__post_init__() can mark `self` as frozen in some
-    # contexts.
-    if self.fprop_dtype is None:
-      self.fprop_dtype = self.dtype
-    super().__post_init__()
-
-  # Compatiblity stubs:
-  # * `self.hparams` returns a Fiddle Config that can be used to build self.
-  # * `self.HParams` returns a stub class that can be called to generate a
-  #   `fdl.Config`; or can be used with `base_hyperparams.sub_config_field`.
-  hparams = functools.cached_property(_FiddleHParamsInstanceStub)
-  HParams = _FiddleHParamsClassStubDescriptor()  # pylint: disable=invalid-name
 
   @classmethod
   def config(cls, **kwargs) -> pax_fiddle.Config:
     return pax_fiddle.Config(cls, **kwargs)
-
-  @functools.cached_property
-  def _hparam_fields(self) -> Set[str]:
-    return set(field.name for field in dataclasses.fields(self) if field.init)
-
-  @classmethod
-  def __init_subclass__(cls, **kwargs: Any):
-    cls._override_split_dim_mapping_fields()
-    if 'HParams' in cls.__dict__:
-      raise ValueError(f'Layer {cls} is a subclass of FiddleBaseLayer, so '
-                       'it should not have a nested HParams class.')
-    super().__init_subclass__(**kwargs)
-    for field in dataclasses.fields(cls):
-      if isinstance(field.default, fdl.Buildable):
-        raise ValueError(
-            f"{cls.__qualname__}.{field.name}'s default value is a mutable "
-            'instance of fdl.Buildable.  Please update this field to use a '
-            'default_factory instead, to avoid unintentional object sharing.')
-      if (_is_template_type(field.type) and
-          not pax_fiddle.has_do_not_build_tag(field)):
-        raise ValueError(
-            f'{cls.__qualname__}.{field.name} has a template type, but '
-            'does not have the DO_NOT_BUILD tag set.')
-
-  @classmethod
-  def _override_split_dim_mapping_fields(cls):
-    """Overrides the `*_split_dims_mapping` fields, if necessary.
-
-    If WeightShardingHParams or ActivationShardingHParams were overridden by
-    `cls`, then automatically transform them to a dataclass, and update the
-    corresponding dataclass fields to use the new type for their
-    default_factory.
-    """
-    if '__annotations__' not in cls.__dict__:
-      cls.__annotations__ = {}
-    if 'WeightShardingHParams' in cls.__dict__:
-      if not issubclass(cls.WeightShardingHParams,
-                        FiddleBaseLayer.WeightShardingHParams):
-        raise ValueError(
-            f'Expected {cls}.WeightShardingHParams to be a subclass of '
-            'FiddleBaseLayer.WeightShardingHParams')
-      if not typing.TYPE_CHECKING:
-        dataclasses.dataclass(frozen=True)(cls.WeightShardingHParams)
-      # TODO(b/249483164): Change this to use sub_field rather than
-      # template_field after the Fiddle migration.
-      cls.__annotations__['weight_split_dims_mapping'] = (
-          pax_fiddle.Config[cls.WeightShardingHParams])
-      cls.weight_split_dims_mapping = pax_fiddle.template_field(
-          cls.WeightShardingHParams)
-    if 'ActivationShardingHParams' in cls.__dict__:
-      if not issubclass(cls.ActivationShardingHParams,
-                        FiddleBaseLayer.ActivationShardingHParams):
-        raise ValueError(
-            f'Expected {cls}.ActivationShardingHParams to be a subclass of '
-            'FiddleBaseLayer.ActivationShardingHParams')
-      if not typing.TYPE_CHECKING:
-        dataclasses.dataclass(frozen=True)(cls.ActivationShardingHParams)
-      # TODO(b/249483164): Change this to use sub_field rather than
-      # template_field after the Fiddle migration.
-      cls.__annotations__['activation_split_dims_mapping'] = (
-          pax_fiddle.Config[cls.ActivationShardingHParams])
-      cls.activation_split_dims_mapping = pax_fiddle.template_field(
-          cls.ActivationShardingHParams)
 
 
 def _is_template_type(typ):
@@ -2277,8 +2224,7 @@ def _is_template_type(typ):
     return True
   if origin == pax_fiddle.Config:
     return True
-  if (origin == Union and
-      any(_is_template_type(arg) for arg in typing.get_args(typ))):
+  if any(_is_template_type(arg) for arg in typing.get_args(typ)):
     return True
   return False
 
@@ -2322,42 +2268,13 @@ def compatible_hparams(
 class _WrapperLayer(BaseLayer):
   """A simple wrapper layer."""
 
-  class HParams(BaseLayer.HParams):
-    """Hyperparameters for this layer."""
-    cld: Optional[BaseLayer.HParams] = None
+  cld_tpl: Optional[pax_fiddle.Config[BaseLayer]] = template_field(None)
 
   def setup(self) -> None:
-    p = self.hparams
-    name = p.name
     # create child under the name space of 'name'.
     # This implicitly set p.cld.name to name as well.
-    self.create_child(name, p.cld)
-    self.cld = getattr(self, name)
-
-
-@enum.unique
-class QuantizationMode(str, enum.Enum):
-  """The different modes for quantization.
-
-  INFERENCE indicates that the model is already quantized and is ready to run
-    inference with the previously set dtypes.
-  QUANTIZE indicates that the model is still float and is going to be quantized
-    according to the provided dtypes.
-  """
-  INFERENCE = 'inference'
-  QUANTIZE = 'quantize'
-
-
-class QuantizationHParams(base_hyperparams.BaseHyperParams):
-  """Parameters for quantization.
-
-  Currently supports only post-training quantization.
-
-  Attributes:
-    mode: the quantization mode associated with this quantization parameter.
-  """
-
-  mode: QuantizationMode = QuantizationMode.INFERENCE
+    self.create_child(self.name, self.cld_tpl)
+    self.cld = getattr(self, self.name)
 
 
 def get_template_fields(
@@ -2381,3 +2298,8 @@ def get_template_fields(
     ]
   else:
     raise TypeError(f'Unexpected type for template: {type(template)}')
+
+
+# Backwards-compatibility aliases.
+# TODO(b/249483164): Remove these once the HParams->Fiddle migration is done.
+BaseLayerApi = BaseLayer

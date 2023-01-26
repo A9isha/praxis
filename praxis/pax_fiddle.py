@@ -21,7 +21,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
-from typing import overload, Any, Callable, Collection, Generic, Optional, TypeVar, Union
+from typing import overload, Any, Callable, Collection, Container, Generic, Optional, TypeVar, Union
 
 import fiddle as fdl
 from fiddle import building
@@ -33,9 +33,33 @@ from fiddle.experimental.dataclasses import field as fdl_field
 import fiddle.extensions.jax
 from flax.linen import module as flax_module
 
+# Import standard Fiddle APIs that we don't modify into this namespace.
+# (So users can use e.g. `pax_fiddle.set_tags` instead of `fdl.set_tags`.)
+add_tag = fdl.add_tag
+ArgFactory = fdl.ArgFactory
+assign = fdl.assign
+Buildable = fdl.Buildable
+cast = fdl.cast
+clear_tags = fdl.clear_tags
+copy_with = fdl.copy_with
+deepcopy_with = fdl.deepcopy_with
+get_callable = fdl.get_callable
+get_tags = fdl.get_tags
+NO_VALUE = fdl.NO_VALUE
+ordered_arguments = fdl.ordered_arguments
+Partial = fdl.Partial
+remove_tag = fdl.remove_tag
+set_tags = fdl.set_tags
+update_callable = fdl.update_callable
+materialize_defaults = fdl.materialize_defaults
+set_tagged = fdl.set_tagged
+Tag = fdl.Tag
+TaggedValue = fdl.TaggedValue
+
+
 fdl_field = fdl_dataclasses.field
 TagOrTags = Union[type(fdl.Tag), Collection[type(fdl.Tag)]]
-T = TypeVar('T')
+_T = TypeVar('_T')
 
 fiddle.extensions.jax.enable()
 history.add_exclude_location('praxis/pax_fiddle.py')
@@ -50,13 +74,13 @@ class CloneAndSetMixin:
   def set(self, **kwargs):
     # Note: we don't use `fdl.assign` here because this mixin will be used
     # with classes that are not `fdl.Buildable` (e.g.,
-    # `FiddleBaseLayer.ActivationSharding`).
+    # `BaseLayer.ActivationSharding`).
     for name, value in kwargs.items():
       setattr(self, name, value)
     return self
 
 
-class PaxConfig(Generic[T], fdl.Config[T], CloneAndSetMixin):
+class PaxConfig(Generic[_T], fdl.Config[_T], CloneAndSetMixin):
   """Subclasses `fdl.Config` to make it more compatible with HParams."""
 
   @property
@@ -83,7 +107,11 @@ class PaxConfig(Generic[T], fdl.Config[T], CloneAndSetMixin):
       assert len(self.ici_mesh_shape) == len(self.dcn_mesh_shape)
       return [i * d for i, d in zip(self.ici_mesh_shape, self.dcn_mesh_shape)]
 
-  def copy_fields_from(self, source: PaxConfig, missing_fields_in_self=()):
+  def copy_fields_from(
+      self,
+      source: PaxConfig,
+      missing_fields_in_self: Container[str] = (),
+  ) -> None:
     """Copies fields from `source`.
 
     Corresponds with `BaseHyperparams.copy_fields_from`.
@@ -167,16 +195,21 @@ class DoNotBuild(fdl.Tag):
   """
 
 
-def has_do_not_build_tag(field: dataclasses.Field):  # pylint: disable=g-bare-generic
+def has_do_not_build_tag(field: dataclasses.Field[Any]) -> bool:
   return fdl_dataclasses.field_has_tag(field, DoNotBuild)
 
 
-def _auto_config_exemption_policy(fn_or_cls):
+def _auto_config_exemption_policy(fn_or_cls) -> bool:
   return (fn_or_cls is PaxConfig or
+          (getattr(fn_or_cls, '__func__', None) is
+           fdl_auto_config.AutoConfig.as_buildable) or
           fdl_auto_config.auto_config_policy.latest(fn_or_cls))
 
 
-def auto_config(fn=None, **auto_config_kwargs) -> Any:
+def auto_config(
+    fn: Optional[Callable[..., Any]] = None,
+    **auto_config_kwargs: Any,
+) -> Any:
   """Version of Fiddle's auto_config that generates PaxConfig objects."""
   auto_config_kwargs['experimental_exemption_policy'] = (
       _auto_config_exemption_policy)
@@ -185,9 +218,9 @@ def auto_config(fn=None, **auto_config_kwargs) -> Any:
 
   def make_auto_config(fn):
 
-    # If `pax_fiddle.auto_config` is applied to a class, then return the
-    # result of applying it to the constructor.  This is helpful for the
-    # automatic `auto_config` wrapping done by `sub_field` and `template_field`.
+    # If `pax_fiddle.auto_config` is applied to a class, then return the result
+    # of applying it to the constructor.  This is helpful for the automatic
+    # `auto_config` wrapping done by `instance_field` and `template_field`.
     if isinstance(fn, type):
       original_fn = fn
 
@@ -208,10 +241,10 @@ def auto_config(fn=None, **auto_config_kwargs) -> Any:
   return make_auto_config if fn is None else make_auto_config(fn)
 
 
-def sub_field(
-    default_factory: Callable[..., Any],
-    tags: Optional[TagOrTags] = tuple(),
-) -> Union[dataclasses.Field, Any]:  # pylint: disable=g-bare-generic
+def instance_field(
+    default_factory: Optional[Callable[..., Any]],
+    tags: TagOrTags = (),
+) -> Union[dataclasses.Field[Any], Any]:
   """Dataclass field specification for a Fiddle-configurable dataclass field.
 
   This can be used to specify that a dataclass should have a default value of
@@ -221,16 +254,20 @@ def sub_field(
   Example usage:
 
   >>> class Parent(base_layer.BaseLayer):
-  ...   child: Child = pax_fiddle.sub_field(Child)
+  ...   child: Child = instance_field(Child)
 
   Args:
-    default_factory: The dataclass type used by the field.
+    default_factory: The dataclass type used by the field.  If `None`, then the
+      field defaults to `None`.
     tags: One or more tags to attach to the `fdl.Buildable`'s argument
       corresponding to the field, when building a `fdl.Buildable`.
 
   Returns:
     A `dataclasses.Field` specification for the field.
   """
+  if default_factory is None:
+    return fdl_field(default=None, tags=tags)
+
   # `factory` will return a PaxConfig object in the Fiddle.as_buildable path,
   # but will be `default_factory()` in the Python path.
   factory = auto_config(default_factory)
@@ -239,8 +276,8 @@ def sub_field(
 
 def template_field(
     template: Optional[Callable[..., Any]],
-    tags: Optional[TagOrTags] = tuple(),
-) -> Union[dataclasses.Field, Any]:  # pylint: disable=g-bare-generic
+    tags: TagOrTags = (),
+) -> Union[dataclasses.Field[Any], Any]:
   """Dataclass field specification for a Fiddle-configurable template field.
 
   This can be used to specify that a dataclass should have a default value of
@@ -250,7 +287,7 @@ def template_field(
   Example usage:
 
   >>> class Parent(base_layer.BaseLayer):
-  ...   child_tpl: fdl.Config[Child] = pax_fiddle.template_field(Child)
+  ...   child_tpl: fdl.Config[Child] = template_field(Child)
 
   Args:
     template: The template type (or factory function).  If `None`, then the
@@ -274,11 +311,10 @@ def template_field(
 
 
 # Typing overloads for pax_build
-T = TypeVar('T')
 
 
 @overload
-def build(buildable: fdl.Partial[T]) -> Callable[..., T]:
+def build(buildable: fdl.Partial[_T]) -> Callable[..., _T]:
   ...
 
 
@@ -288,7 +324,7 @@ def build(buildable: fdl.Partial) -> Callable[..., Any]:
 
 
 @overload
-def build(buildable: fdl.Config[T]) -> T:
+def build(buildable: fdl.Config[_T]) -> _T:
   ...
 
 
@@ -301,7 +337,7 @@ def build(buildable):
   """Specialized version of `fdl.build` that respects the `DoNotBuild` tag.
 
   When building `buildable`, if any arguments are tagged with `DoNotBuild`,
-  then return them as-is, rather than building them.  This makes it posible
+  then return them as-is, rather than building them.  This makes it possible
   to keep templates unbuilt, so they can be used for deferred subtree building.
 
   Args:
@@ -321,7 +357,7 @@ def build(buildable):
         else:
           # Clear the flax module stack, to avoid having `nn.Module`s be auto-
           # parented to the current module.  This is important for directly
-          # instantiated *nested* descendents.
+          # instantiated *nested* descendants.
           with empty_flax_module_stack():
             arguments[key] = state.call(sub_value, daglish.Attr(key))
       return building.call_buildable(
@@ -344,11 +380,8 @@ def empty_flax_module_stack():
     module_stack[:] = old_modules  # Restore module stack.
 
 
-_hparams_node_traverser_registry = daglish.NodeTraverserRegistry()
-
-# Copy existing traversers.
-_hparams_node_traverser_registry._node_traversers = (  # pylint: disable=protected-access
-    daglish._default_traverser_registry._node_traversers.copy())  # pylint: disable=protected-access
+_hparams_node_traverser_registry = daglish.NodeTraverserRegistry(
+    use_fallback=True)
 
 
 def _register_traversers_for_subclass(subclass):

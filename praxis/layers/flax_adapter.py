@@ -26,7 +26,6 @@ from praxis import flax_utils
 from praxis import pytypes
 
 JTensor = pytypes.JTensor
-BaseHParams = base_layer.BaseLayer.HParams
 LogicalAxisRules = pytypes.LogicalAxisRules
 
 
@@ -38,16 +37,12 @@ class FlaxModuleAdapterBase(base_layer.BaseLayer, metaclass=abc.ABCMeta):
 
   This adapter assumes that the module has a single compact method __call__. If
   this constraint is not satisfied, a similar adapter can be easily constructed.
+
+  Attributes:
+    logical_axes_rules: Optional logical axes rules, e.g., [('input', 'mdl'),
+      ('output', 'data')]
   """
-
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      logical_axes_rules: Optional logical axes rules, e.g., [('input', 'mdl'),
-        ('output', 'data')]
-    """
-    logical_axes_rules: Optional[LogicalAxisRules] = None
+  logical_axes_rules: Optional[LogicalAxisRules] = None
 
   def setup(self) -> None:
     # Construct the child, which can be an arbitrary nn.Module.
@@ -59,14 +54,13 @@ class FlaxModuleAdapterBase(base_layer.BaseLayer, metaclass=abc.ABCMeta):
     """Builds the Flax module to be wrapped by this layer."""
     pass
 
-  def __call__(self, *args, **kwargs):
-    p = self.hparams
+  def _call_with_boxed_params_init(self, unbound_method, *args, **kwargs):
 
     def call_fn(module, *args, **kwargs):
       # axis_rules context manager is used to map activation sharding logical
       # axes to mesh axes names that pjit expects.
-      with flax_partitioning.axis_rules(p.logical_axes_rules):
-        return module.__call__(*args, **kwargs)
+      with flax_partitioning.axis_rules(self.logical_axes_rules):
+        return unbound_method(module, *args, **kwargs)
 
     if not self.is_initializing():
       return call_fn(self.cld, *args, **kwargs)
@@ -86,69 +80,66 @@ class FlaxModuleAdapterBase(base_layer.BaseLayer, metaclass=abc.ABCMeta):
         trans_in_fn=base_layer.maybe_unbox_value,
         trans_out_fn=functools.partial(
             flax_utils.convert_to_boxed_params,
-            logical_axes_rules=p.logical_axes_rules,
-            mesh_shape=p.mesh_shape,
-        ))
+            logical_axes_rules=self.logical_axes_rules,
+            mesh_shape=self.mesh_shape,
+        ),
+    )
 
     # Call the final mapped_fn.
     return mapped_fn(self.cld, *args, **kwargs)
 
+  def __call__(self, *args, **kwargs):
+    # Note that `__func__` retrieves the unbound method that takes module as
+    # the first argument.
+    return self._call_with_boxed_params_init(
+        self.cld.__call__.__func__, *args, **kwargs  # pytype: disable=attribute-error
+    )
+
 
 class FlaxModuleAdapter(FlaxModuleAdapterBase):
-  """Adapts an nn.Module built from a factory function."""
+  """Adapts an nn.Module built from a factory function.
 
-  class HParams(FlaxModuleAdapterBase.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      module_factory_method: A callable that constructs an instance of a module.
-    """
-    module_factory_method: Optional[Callable[[], Any]] = None
+  Attributes:
+    module_factory_method: A callable that constructs an instance of a module.
+  """
+  module_factory_method: Optional[Callable[[], Any]] = None
 
   def _build_wrapped_module(self) -> nn.Module:
-    p = self.hparams
-    if p.module_factory_method is None:
+    if self.module_factory_method is None:
       raise ValueError('module_factory_method must be set.')
-    return p.module_factory_method()
+    return self.module_factory_method()
 
 
 class EncoderDecoderFlaxModuleAdaptor(FlaxModuleAdapter):
   """Similar to FlaxModuleAdapter, but it also have encode/decode methods."""
 
   def encode(self, *args, **kwargs):
-    # axis_rules context manager is used to map activation sharding logical
-    # axes to mesh axes names that pjit expects.
-    with flax_partitioning.axis_rules(self.hparams.logical_axes_rules):
-      return self.cld.encode(*args, **kwargs)
+    return self._call_with_boxed_params_init(
+        self.cld.encode.__func__, *args, **kwargs  # pytype: disable=attribute-error
+    )
 
   def decode(self, *args, **kwargs):
-    # axis_rules context manager is used to map activation sharding logical
-    # axes to mesh axes names that pjit expects.
-    with flax_partitioning.axis_rules(self.hparams.logical_axes_rules):
-      return self.cld.decode(*args, **kwargs)
+    return self._call_with_boxed_params_init(
+        self.cld.decode.__func__, *args, **kwargs  # pytype: disable=attribute-error
+    )
 
   def compute_logits(self, *args, **kwargs):
-    # axis_rules context manager is used to map activation sharding logical
-    # axes to mesh axes names that pjit expects.
-    with flax_partitioning.axis_rules(self.hparams.logical_axes_rules):
-      return self.cld.compute_logits(*args, **kwargs)
+    return self._call_with_boxed_params_init(
+        self.cld.compute_logits.__func__, *args, **kwargs  # pytype: disable=attribute-error
+    )
 
 
 # TODO(austinwaters): verify that post_init_hparams does something reasonable
 # when hparams contain a fdl.Config.
 class FiddleFlaxModuleAdapter(FlaxModuleAdapterBase):
-  """Adapts an nn.Module built from a fdl.Config."""
+  """Adapts an nn.Module built from a fdl.Config.
 
-  class HParams(FlaxModuleAdapterBase.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      fdl_config: A fdl.Config expressing the module to be created.
-    """
-    flax_module_factory: Optional[Callable[[], nn.Module]] = None
+  Attributes:
+    fdl_config: A fdl.Config expressing the module to be created.
+  """
+  flax_module_factory: Optional[Callable[[], nn.Module]] = None
 
   def _build_wrapped_module(self) -> nn.Module:
-    p = self.hparams
-    if p.flax_module_factory is None:
+    if self.flax_module_factory is None:
       raise ValueError('flax_module_factory must be set.')
-    return p.flax_module_factory()
+    return self.flax_module_factory()

@@ -16,12 +16,13 @@ steps:
 
 substitutions:
     _PYTHON_VERSION: '3.8'
-    _RELEASE_VERSION: '0.2.0'  # or rX.Y
+    _RELEASE_VERSION: '0.2.1'  # or rX.Y
     _IMAGE_NAME: 'praxis_${_RELEASE_VERSION}_${_PYTHON_VERSION}'
     _WHEEL_FOLDER: '/tmp/wheels'
 options:
     dynamic_substitutions: true
     substitution_option: 'ALLOW_LOOSE'
+    machineType: E2_HIGHCPU_8
 timeout: 5400s
 artifacts:
   objects:

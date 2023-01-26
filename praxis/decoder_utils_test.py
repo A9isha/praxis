@@ -25,15 +25,34 @@ from praxis import test_utils
 
 class DecoderUtilsTest(test_utils.TestCase):
 
+  # pyformat:disable
   @parameterized.parameters(
-      ([4], [[-1.0e+09, 4, 3, 2, 25, 4, 3, 2, 0, 0, 0, 0, -1.0e+09, 4, 3, 2]
-            ], [[25, 4, 4, 4]], [[4, 1, 5, 13]]),
-      ([1, 4], [[
-          -1.0e+09, 4, -1.0e+09, 2, 25, -1.0e+09, 3, 2, 0, -1.0e+09, 0, 0,
-          -1.0e+09, 4, 3, -1.0e+09
-      ]], [[25, 4, 4, 3]], [[4, 1, 13, 6]]),
+      ([4],
+       [
+           [-1.0e+09, 4, 3, 2, 25, 4, 3, 2, 0, 0, 0, 0, -1.0e+09, 4, 3, 2]
+       ],
+       [
+           [25, 4, 4, 4]
+       ],
+       [
+           [4, 1, 5, 13]
+       ]),
+      ([1, 4],
+       [
+           [
+               -1.0e+09, 4, -1.0e+09, 2, 25, -1.0e+09, 3, 2, 0, -1.0e+09, 0, 0,
+               -1.0e+09, 4, 3, -1.0e+09
+           ]
+       ],
+       [
+           [25, 4, 4, 3]
+       ],
+       [
+           [4, 1, 13, 6]
+       ]),
   )
-  def test_two_stage_topk(self, terminal_ids, topk_value_target,
+  # pyformat:enable
+  def test_two_stage_topk(self, terminal_ids, target_topk_value,
                           target_final_topk_value, target_final_topk_indices):
     hyp_scores = np.zeros((1, 4))
     logits = [
@@ -48,7 +67,7 @@ class DecoderUtilsTest(test_utils.TestCase):
 
     # Compares 1st topk
     self.assertArraysEqual(topk_value,
-                           np.array(topk_value_target, dtype=np.float32))
+                           np.array(target_topk_value, dtype=np.float32))
     self.assertArraysEqual(
         topk_indices,
         np.array([[4, 2, 1, 0, 0, 1, 2, 3, 0, 1, 2, 3, 4, 3, 2, 1]],
@@ -144,6 +163,33 @@ class DecoderUtilsTest(test_utils.TestCase):
             [[[[1, 2, 3, 5, 2, 0], [1, 3, 5, 2, 0, 0], [1, 2, 3, 4, 5, 2]],
               [[1, 2, 3, 7, 3, 0], [1, 3, 7, 3, 0, 0], [1, 2, 3, 4, 7, 3]]]],
             dtype=jnp.int32))
+
+  def test_end_with_sequences(self):
+    end_sequences = jnp.array(
+        [[1, 5, 2], [0, 0, 3], [0, 5, 2]], dtype=jnp.int32
+    )
+    output_ids = jnp.array(
+        [[0, 1, 3, 1, 5, 2], [1, 2, 3, 4, 5, 0], [7, 8, 9, 5, 2, 3]],
+        dtype=jnp.int32,
+    )
+
+    # True for the 1st element in the batch.
+    result = decoder_utils.end_with_sequences(
+        end_sequences, output_ids, decode_step=5
+    )
+    self.assertArraysEqual(result, jnp.array([1, 0, 0], dtype=jnp.bool_))
+
+    # True for the 2nd element in the batch.
+    result = decoder_utils.end_with_sequences(
+        end_sequences, output_ids, decode_step=jnp.array(2, dtype=jnp.int32)
+    )
+    self.assertArraysEqual(result, jnp.array([0, 1, 0], dtype=jnp.bool_))
+
+    # True for the 3rd element in the batch.
+    result = decoder_utils.end_with_sequences(
+        end_sequences, output_ids, decode_step=4
+    )
+    self.assertArraysEqual(result, jnp.array([0, 0, 1], dtype=jnp.bool_))
 
 
 if __name__ == '__main__':

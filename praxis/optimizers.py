@@ -315,7 +315,7 @@ class _HeroLionOptState:
 class _ShardedHeroLionHelper(_ShardedAdamHelper):
   """A helper class facilitates the creation of sharded_hero_lion_optimizer."""
 
-  def opt_state_sharding_spec(self,
+  def opt_state_sharding_spec(self,  # pytype: disable=signature-mismatch  # overriding-return-type-checks
                               var_hparams: WeightHParams) -> _HeroLionOptState:
     """Returns optimizer sharding spec for one particular variable."""
     m_var_hparams = var_hparams.clone()
@@ -323,13 +323,13 @@ class _ShardedHeroLionHelper(_ShardedAdamHelper):
     # m simply share the same sharding.
     return _HeroLionOptState(m=m_var_hparams)
 
-  def init_opt_state(self,
+  def init_opt_state(self,  # pytype: disable=signature-mismatch  # overriding-return-type-checks
                      var_hparams: WeightHParams,
                      m_dtype: jnp.dtype = jnp.float32) -> _HeroLionOptState:
     """Returns optimizer state for one particular variable."""
     return _HeroLionOptState(m=jnp.zeros_like(var_hparams, dtype=m_dtype))
 
-  def update_moments(self, step: JTensor, update: JTensor,
+  def update_moments(self, step: JTensor, update: JTensor,  # pytype: disable=signature-mismatch  # overriding-return-type-checks
                      moments: _HeroLionOptState,
                      beta2: float) -> _HeroLionOptState:
     """Updates momentum value."""
@@ -754,9 +754,15 @@ def apply_ema_weights(decay: float) -> ShardedGradientTransformation:
     # https://github.com/tensorflow/tensorflow/blob/v2.9.1/tensorflow/python/training/moving_averages.py#L469
     ema_decay = jnp.minimum(decay, (1. + state.count) / (10. + state.count))
 
-    new_ema = jax.tree_map(
-        lambda old_v, new_v: old_v - (1. - ema_decay) * (old_v - new_v),
-        state.ema, params)
+    def update_func(old_v, new_v):
+      if old_v.dtype == jnp.bool_ or jnp.issubdtype(old_v, jnp.integer):
+        # If it is integer, we directly return the new variable
+        # This is mainly supported for non_trainable
+        return new_v
+      else:
+        return old_v - (1.0 - ema_decay) * (old_v - new_v)
+
+    new_ema = jax.tree_map(update_func, state.ema, params)
     count_inc = state.count + jnp.array(1, jnp.int32)
 
     return updates, NestedMap(count=count_inc, ema=new_ema)
@@ -774,8 +780,9 @@ def apply_ema_weights(decay: float) -> ShardedGradientTransformation:
           init=None,
           dtype=x.dtype,
           collections=None,
-          mesh_shape=mesh_shape,
-          tensor_split_dims_mapping=[-1] * len(x.shape))
+          mesh_shape=x.mesh_shape,
+          tensor_split_dims_mapping=x.tensor_split_dims_mapping,
+      )
 
     return NestedMap(
         count=WeightHParams(
@@ -786,6 +793,124 @@ def apply_ema_weights(decay: float) -> ShardedGradientTransformation:
             mesh_shape=mesh_shape,
             tensor_split_dims_mapping=[]),
         ema=jax.tree_map(_infer_ema_pspec, params))
+
+  return ShardedGradientTransformation(
+      init=init_fn,
+      update=update_fn,
+      init_partition_spec=init_partition_spec_fn)
+
+
+def apply_ewc_regularization(
+    learning_rate_fn: optax.Schedule,
+    ewc_regularizer_weight: float = 0.0,
+    ewc_weight_per_var: Optional[bool] = False
+    ) -> ShardedGradientTransformation:
+  """Applies EWC regularization on weights.
+
+  paper: https://arxiv.org/abs/1612.00796
+  EWC regularizer add a ewc_weight * 1 / 2 *(params - pretrain_params)**2 to
+  the final objective loss.
+
+  Args:
+    learning_rate_fn: Learning rate function.
+    ewc_regularizer_weight: A float number as the EWC regularization weight.
+      if ewc_regularizer_weight <= 0, EWC is disabled.
+    ewc_weight_per_var: EWC weight for each variable.
+
+  Returns:
+    A GradientTransformation applying EWC regularizers.
+  """
+  def init_fn(params):
+    if ewc_regularizer_weight > 0.0:
+      if ewc_weight_per_var:
+        var_weights = jax.tree_map(
+            lambda p, v: jnp.array(ewc_regularizer_weight * 1./ 2 * v, p.dtype),
+            params, ewc_weight_per_var)
+      else:
+        var_weights = jax.tree_map(
+            lambda v: jnp.array(ewc_regularizer_weight * 1./ 2, v.dtype),
+            params)
+      return NestedMap(count=jnp.array(0, dtype=jnp.int32),
+                       pretrain_vars=jax.tree_map(jnp.copy, params),
+                       var_weights=var_weights)
+    else:
+      return NestedMap(count=jnp.array(0, dtype=jnp.int32))
+
+  def update_fn(updates, state, params):
+    count = state.count
+    lr = learning_rate_fn(count)
+    if ewc_regularizer_weight > 0.0:
+      if params is None:
+        raise ValueError('Params required for the EWC')
+      def fn(g, p, w, v):
+        v = jnp.where(jnp.equal(state.count, 0), p, v)
+        return g - lr * w * (p - v) if not py_utils.is_optax_masked_node(
+            g) else optax.MaskedNode()
+
+      def pretrain_fn(p, v):
+        return jnp.where(jnp.equal(state.count, 0), p, v)
+
+      updates = jax.tree_map(
+          fn,
+          updates,
+          params,
+          state.var_weights,
+          state.pretrain_vars)
+
+      update_states = NestedMap(
+          count=state.count + 1,
+          pretrain_vars=jax.tree_map(pretrain_fn, params, state.pretrain_vars),
+          var_weights=state.var_weights)
+    else:
+      update_states = NestedMap(
+          count=state.count + 1)
+    return updates, update_states
+
+  def init_partition_spec_fn(params):
+    var_spec_flattened, _ = jax.tree_util.tree_flatten(params)
+    assert var_spec_flattened
+    first_var = var_spec_flattened[0]
+    assert isinstance(first_var, WeightHParams)
+    mesh_shape = first_var.mesh_shape
+
+    def _infer_ewc_pspec(x):
+      return WeightHParams(
+          shape=x.shape,
+          init=None,
+          dtype=x.dtype,
+          collections=None,
+          mesh_shape=mesh_shape,
+          tensor_split_dims_mapping=x.tensor_split_dims_mapping)
+
+    def _infer_ewc_weights_pspec(x):
+      return WeightHParams(
+          shape=[],
+          init=None,
+          dtype=x.dtype,
+          collections=None,
+          mesh_shape=mesh_shape,
+          tensor_split_dims_mapping=[])
+
+    if ewc_regularizer_weight > 0.0:
+      return NestedMap(
+          count=WeightHParams(
+              shape=[],
+              init=None,
+              dtype=jnp.int32,
+              collections=None,
+              mesh_shape=mesh_shape,
+              tensor_split_dims_mapping=[]),
+          pretrain_vars=jax.tree_map(_infer_ewc_pspec, params),
+          var_weights=jax.tree_map(_infer_ewc_weights_pspec, params))
+    else:
+      return NestedMap(
+          count=WeightHParams(
+              shape=[],
+              init=None,
+              dtype=jnp.int32,
+              collections=None,
+              mesh_shape=mesh_shape,
+              tensor_split_dims_mapping=[]))
 
   return ShardedGradientTransformation(
       init=init_fn,
@@ -823,6 +948,11 @@ class BaseOptimizer(base_hyperparams.BaseParameterizable):
         schedule is *multiplied* by your base learning rate.
       ema_decay: If > 0, enable ExponentialMovingAverage during training with
         the give decay. Must be < 1. Disabled if <= 0.
+      ewc_regularizer_weight: If > 0, EWC regularization is applied to
+        the model weights.
+      ewc_weight_per_var: If not None, set weight for each model weight, e.g.,
+        refer to https://arxiv.org/abs/1612.00796 by using a Fisher information
+        matrix.
     """
     l2_regularizer_weight: Optional[float] = None
     l1_regularizer_weight: Optional[float] = None
@@ -833,6 +963,8 @@ class BaseOptimizer(base_hyperparams.BaseParameterizable):
     learning_rate: float = 0.0
     lr_schedule: Optional[schedules.BaseSchedule.HParams] = None
     ema_decay: float = 0.0
+    ewc_regularizer_weight: float = 0.0
+    ewc_weight_per_var: Optional[NestedMap] = None
 
   def __init__(self, hparams: BaseOptimizer.HParams) -> None:
     super().__init__(hparams)
@@ -899,6 +1031,12 @@ class BaseOptimizer(base_hyperparams.BaseParameterizable):
             var_wd_mask=var_lp_mask,
             regularizer_weight=p.decoupled_weight_decay),
     ]
+    if p.ewc_regularizer_weight > 0.0:
+      optax_list.append(
+          apply_ewc_regularization(
+              self.get_learning_rate,
+              ewc_regularizer_weight=p.ewc_regularizer_weight,
+              ewc_weight_per_var=p.ewc_weight_per_var))
     if p.ema_decay > 0.0 and include_ema:
       # EMA adds new optimizer states that is not compatible
       asserts.lt(p.ema_decay, 1.)
@@ -938,6 +1076,50 @@ class Sgd(BaseOptimizer):
       self, lr: optax.Schedule) -> optax.GradientTransformation:
     p = self._hparams
     return optax.sgd(learning_rate=lr, momentum=p.momentum, nesterov=p.nesterov)
+
+
+class Lamb(BaseOptimizer):
+  """Canonical Lamb optimizer."""
+
+  class HParams(BaseOptimizer.HParams):
+    """Defines hyper-params for Lamb.
+
+    Please check optax lamb doc for more details.
+
+    Attributes:
+      momentum: Decay rate used by the momentum term. If set to None, momentum
+        is not used.
+      b1: Exponential decay rate to track the first moment of past gradients.
+        nesterov: Whether Nesterov momentum is used or not.
+      b2: Exponential decay rate to track the second moment of past gradients.
+      eps: A small constant applied to denominator outside of the square root
+        (as in the Adam paper) to avoid dividing by zero when rescaling.
+      eps_root: A small constant applied to denominator inside the square root
+        (as in RMSProp), to avoid dividing by zero when rescaling.
+      weight_decay: Strength of the weight decay regularization.
+      mask: A boolean tree mask that determines which leaves to transform.
+    """
+
+    b1: float = 0.9
+    b2: float = 0.999
+    eps: float = 1e-6
+    eps_root: float = 0.0
+    weight_decay: float = 0.0
+    mask: Optional[Any] = None
+
+  def _get_raw_grad_transformation(
+      self, lr: optax.Schedule
+  ) -> optax.GradientTransformation:
+    p = self._hparams
+    return optax.lamb(
+        learning_rate=lr,
+        b1=p.b1,
+        b2=p.b2,
+        eps=p.eps,
+        eps_root=p.eps_root,
+        weight_decay=p.weight_decay,
+        mask=p.mask,
+    )
 
 
 class ShardedSgd(BaseOptimizer):
@@ -1183,6 +1365,12 @@ class DistributedShampoo(BaseOptimizer):
       decoupled_weight_decay_from_momentum: Decouple weight decay from momentum.
       decoupled_learning_rate_from_momentum: Decouple learning rate from
         momentum.
+      eigh: If True, uses eigendecomposition to compute inverse-pth roots.
+      compression_rank: If nonzero, whether to use low-rank preconditioners.
+      frequent_directions: Use frequent directions sketching for preconditioner.
+      average_grad: Whether to average gradients before usage in FD statistics.
+      reuse_preconditioner: Wire in previous preconditioner for root updates.
+        must be set to true for frequent directions.
     """
     block_size: int = 1024
     beta1: float = 0.9
@@ -1212,7 +1400,6 @@ class DistributedShampoo(BaseOptimizer):
     relative_matrix_epsilon: bool = True
     cholesky: bool = False
     qr_based_root: bool = False
-    sharded_statistics_only: bool = False
     merge_small_dims_block_size: int = 4096
     lobpcg_topk_precondition: int = 0
     lobpcg_max_iter: int = 0
@@ -1220,6 +1407,11 @@ class DistributedShampoo(BaseOptimizer):
     summarize_training_metrics: bool = True
     decoupled_weight_decay_from_momentum: bool = True
     decoupled_learning_rate_from_momentum: bool = False
+    eigh: bool = False
+    compression_rank: int = 0
+    frequent_directions: bool = False
+    average_grad: bool = False
+    reuse_preconditioner: bool = False
 
   @classmethod
   def HParamsImageClassification(cls) -> DistributedShampoo.HParams:  # pylint: disable=invalid-name
@@ -1328,12 +1520,16 @@ class DistributedShampoo(BaseOptimizer):
         lobpcg_max_iter=p.lobpcg_max_iter,
         cholesky=p.cholesky,
         qr_based_root=p.qr_based_root,
-        sharded_statistics_only=p.sharded_statistics_only,
         merge_small_dims_block_size=p.merge_small_dims_block_size,
         skip_preconditioning_rank_lt=p.skip_preconditioning_rank_lt,
         decoupled_weight_decay=p.decoupled_weight_decay_from_momentum,
         decoupled_learning_rate=p.decoupled_learning_rate_from_momentum,
         generate_training_metrics=p.summarize_training_metrics,
+        eigh=p.eigh,
+        compression_rank=p.compression_rank,
+        frequent_directions=p.frequent_directions,
+        average_grad=p.average_grad,
+        reuse_preconditioner=p.reuse_preconditioner,
     )
 
 
@@ -1372,7 +1568,6 @@ class ShardedDistributedShampoo(DistributedShampoo):
         nesterov=False,
         exponent_override=0,
         mesh_axis_names=('replica', 'data', 'mdl'),
-        sharded_statistics_only=False,
         tensor_split_dims_mapping=[-1, 1, 2],
         tensor_split_dims_mapping_for_inverse_pth_root=[1, -1, 2],
         start_preconditioning_step=51,
@@ -1448,7 +1643,7 @@ class ShardedDistributedShampoo(DistributedShampoo):
     return jax.tree_map(_weight_param_from_pspec_shape_dtype,
                         partition_spec_opt_state, shapes_and_dtypes)
 
-  def _get_raw_grad_transformation(
+  def _get_raw_grad_transformation(  # pytype: disable=signature-mismatch  # overriding-return-type-checks
       self, lr: optax.Schedule) -> ShardedGradientTransformation:
     result = self._shampoo_transformation(lr)
     # TODO(rohananil): Refactor after PartitionSpec layering is finalized in
@@ -1975,8 +2170,8 @@ class _ShardedAdafactorHelper:
                                   param, var_name):
     """Computes the var and optimizer slots updates for a single variable."""
     # We can probably skip this step
-    grad = self.inf_to_nan(grad)
     grad = grad.astype(jnp.float32)
+    grad = self.inf_to_nan(grad)
     grad_squared = jnp.square(grad)
 
     if self._per_var_learning_summary:

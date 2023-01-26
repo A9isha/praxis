@@ -22,6 +22,7 @@ import jax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from praxis import base_layer
+from praxis import pax_fiddle
 from praxis import pytypes
 from praxis.layers import attentions
 from praxis.layers import embedding_softmax
@@ -30,53 +31,49 @@ from praxis.layers import stochastics
 WeightInit = base_layer.WeightInit
 WeightHParams = base_layer.WeightHParams
 sub_config_field = base_layer.sub_config_field
+template_field = base_layer.template_field
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 JTensor = pytypes.JTensor
 
 SplitDimsMapping = pytypes.SplitDimsMapping
-BaseHParams = base_layer.BaseLayer.HParams
-BaseWtShardingHParams = base_layer.BaseLayer.WeightShardingHParams
-BaseActShardingHParams = base_layer.BaseLayer.ActivationShardingHParams
 
 
 class OneHeadedAttentionProjection(base_layer.BaseLayer):
   """Layer that computes projection with one head.
 
   This layer is expected to be used within MultiQueryAttention below.
+
+  Attributes:
+    input_dim: Input dimension.
+    output_dim: Size of output.
+    use_bias: Whether to add bias in projection or not.
   """
-
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      input_dim: Input dimension.
-      output_dim: Size of output.
-      use_bias: Whether to add bias in projection or not.
-    """
-    input_dim: int = 0
-    output_dim: int = 0
-    use_bias: bool = True
+  input_dim: int = 0
+  output_dim: int = 0
+  use_bias: bool = True
 
   def setup(self) -> None:
-    p = self.hparams
-    wp = p.weight_split_dims_mapping
-    if p.mesh_shape is not None:
+    wp = self.weight_split_dims_mapping
+    if self.mesh_shape is not None:
       assert wp.wt is not None, ('Must provide sharding annotations for the '
                                  'weights if mesh shape is provided')
     wt = wp.wt
-    pc_shape = [p.input_dim, p.output_dim]
+    pc_shape = [self.input_dim, self.output_dim]
     pc = WeightHParams(
-        shape=pc_shape, mesh_shape=p.mesh_shape, tensor_split_dims_mapping=wt)
+        shape=pc_shape, mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt
+    )
     self.create_variable('w', pc)
-    if p.use_bias:
-      if p.mesh_shape is not None:
+    if self.use_bias:
+      if self.mesh_shape is not None:
         bias_split_dims_mapping = [wp.wt[1]]
       else:
         bias_split_dims_mapping = None
       pc_bias = WeightHParams(
-          shape=[p.output_dim],
+          shape=[self.output_dim],
           init=WeightInit.Constant(0.0),
-          mesh_shape=p.mesh_shape,
-          tensor_split_dims_mapping=bias_split_dims_mapping)
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=bias_split_dims_mapping,
+      )
       self.create_variable('b', pc_bias)
 
   def __call__(self, inputs: JTensor) -> JTensor:
@@ -88,18 +85,18 @@ class OneHeadedAttentionProjection(base_layer.BaseLayer):
     Returns:
       The projected JTensor with shape [..., p.output_dim].
     """
-    p = self.hparams
     theta = self.theta
 
     shape = inputs.shape
     inputs = self._cast_to_fprop_dtype(inputs)
     w = theta.w
 
-    assert shape[-1] == p.input_dim, (
-        f'Expecting shape[-1] == p.input_dim, {shape[-1]} != {p.input_dim}')
+    assert (
+        shape[-1] == self.input_dim
+    ), f'Expecting shape[-1] == p.input_dim, {shape[-1]} != {self.input_dim}'
     eqn = '...D,DH->...H'
     ret = jnp.einsum(eqn, inputs, w)
-    if p.use_bias:
+    if self.use_bias:
       ret += theta.b
     return ret
 
@@ -137,59 +134,53 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
   probs:[B, N, T, S] = softmax(logits)
   context:[B, T, N, H] = einsum('BNTS,BSH->BTNH', probs, v_proj)
   Output y:[B, T, D] = einsum('BTNH,DNH>BTD', context, Wout)
+
+  Attributes:
+    input_dim: An integer or a dict of integer values as number of input
+      nodes. If input_dim is a dict, keys must be key, value and query.
+    hidden_dim: Number of hidden nodes.
+    num_heads: Number of attention heads.
+    dim_per_head: Dimension of each attention head. If None then dim_per_head
+      == hidden_dim // num_heads.
+    dropout_tpl: Parameterization for the dropout layer.
+    atten_dropout_prob: Probability at which we apply dropout to the attention
+      weights.
+    proj_tpl: Parameterization for the query projection_tpl layer.
+    headless_proj_tpl: Parameterization for the key/value projection_tpl
+      layer.
+    use_bias: Whether to use bias for projection_tpl layers.
+    output_proj_use_nhd_shape: Whether to use NHD variable shape in output
+      projection layer.
+    internal_enable_query_scale: Internal. Enable scaling of query vector.
+    atten_logit_cap: Cap the absolute values of logits by tanh. Enabled when a
+      positive value is specified. May not be supported by a subclass.
+    use_rotary_position_emb: Whether to add rotary position embedding to the
+      queries and keys before computing self attention scores. This was
+      proposed in https://arxiv.org/abs/2104.09864.
+    relative_bias_tpl: Optional parameterization of relative bias.
+    attention_extra_logit: Extra logit for attention softmax.
+    combine_qkv: Whether to combine qkv tensor for optimizing qkv input
+      gradient computation with SPMD. Only supports self-attention.
+    Note: dconv_qkv and ngrammer are not supported.
   """
-
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      input_dim: An integer or a dict of integer values as number of input
-        nodes. If input_dim is a dict, keys must be key, value and query.
-      hidden_dim: Number of hidden nodes.
-      num_heads: Number of attention heads.
-      dim_per_head: Dimension of each attention head. If None then dim_per_head
-        == hidden_dim // num_heads.
-      dropout_tpl: Parameterization for the dropout layer.
-      atten_dropout_prob: Probability at which we apply dropout to the attention
-        weights.
-      proj_tpl: Parameterization for the query projection_tpl layer.
-      headless_proj_tpl: Parameterization for the key/value projection_tpl
-        layer.
-      use_bias: Whether to use bias for projection_tpl layers.
-      output_proj_use_nhd_shape: Whether to use NHD variable shape in output
-        projection layer.
-      internal_enable_query_scale: Internal. Enable scaling of query vector.
-      atten_logit_cap: Cap the absolute values of logits by tanh. Enabled when a
-        positive value is specified. May not be supported by a subclass.
-      use_rotary_position_emb: Whether to add rotary position embedding to the
-        queries and keys before computing self attention scores. This was
-        proposed in https://arxiv.org/abs/2104.09864.
-      relative_bias_tpl: Optional parameterization of relative bias.
-      attention_extra_logit: Extra logit for attention softmax.
-      combine_qkv: Whether to combine qkv tensor for optimizing qkv input
-        gradient computation with SPMD. Only supports self-attention.
-      Note: dconv_qkv and ngrammer are not supported.
-    """
-    input_dim: Union[int, Dict[str, int]] = 0
-    hidden_dim: int = 0
-    num_heads: int = 1
-    dim_per_head: Optional[int] = None
-    dropout_tpl: BaseHParams = sub_config_field(stochastics.Dropout.HParams)
-    atten_dropout_prob: float = 0.0
-    proj_tpl: BaseHParams = sub_config_field(
-        attentions.AttentionProjection.HParams)
-    headless_proj_tpl: BaseHParams = sub_config_field(
-        OneHeadedAttentionProjection.HParams)
-    internal_gshard_gaussian_init: bool = False
-    use_bias: bool = True
-    output_proj_use_nhd_shape: bool = False
-    internal_enable_query_scale: bool = True
-    atten_logit_cap: float = 0.0
-    use_rotary_position_emb: bool = False
-    relative_bias_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
-    attention_extra_logit: Optional[float] = None
-    dconv_qkv: bool = False
-    combine_qkv: bool = False
+  input_dim: Union[int, Dict[str, int]] = 0
+  hidden_dim: int = 0
+  num_heads: int = 1
+  dim_per_head: Optional[int] = None
+  dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
+  atten_dropout_prob: float = 0.0
+  proj_tpl: LayerTpl = template_field(attentions.AttentionProjection)
+  headless_proj_tpl: LayerTpl = template_field(OneHeadedAttentionProjection)
+  internal_gshard_gaussian_init: bool = False
+  use_bias: bool = True
+  output_proj_use_nhd_shape: bool = False
+  internal_enable_query_scale: bool = True
+  atten_logit_cap: float = 0.0
+  use_rotary_position_emb: bool = False
+  relative_bias_tpl: Optional[LayerTpl] = template_field(None)
+  attention_extra_logit: Optional[float] = None
+  dconv_qkv: bool = False
+  combine_qkv: bool = False
 
   # SPMD partition related params.
   #
@@ -199,7 +190,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
   # b - batch_size
   # l - seq_len
 
-  class WeightShardingHParams(BaseWtShardingHParams):
+  class WeightSharding(base_layer.BaseLayer.WeightSharding):
     """Represents how layer's learned parameters are partitioned across a mesh.
 
     Attributes:
@@ -212,7 +203,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     dconv: SplitDimsMapping = None
     proj_headless: SplitDimsMapping = None
 
-  class ActivationShardingHParams(BaseActShardingHParams):
+  class ActivationSharding(base_layer.BaseLayer.ActivationSharding):
     """Represents how intermediate values should be partitioned across a mesh.
 
     Attributes:
@@ -228,47 +219,49 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     bld: SplitDimsMapping = None
 
   def setup(self) -> None:
-    p = self.hparams
-    wp = p.weight_split_dims_mapping
-    assert p.input_dim, 'input_dim is {}'.format(p.input_dim)
-    assert p.hidden_dim, 'hidden_dim is {}'.format(p.hidden_dim)
+    wp = self.weight_split_dims_mapping
+    assert self.input_dim, 'input_dim is {}'.format(self.input_dim)
+    assert self.hidden_dim, 'hidden_dim is {}'.format(self.hidden_dim)
 
-    assert not p.dconv_qkv
-    assert not p.combine_qkv
+    assert not self.dconv_qkv
+    assert not self.combine_qkv
 
-    dim_per_head = p.dim_per_head
+    dim_per_head = self.dim_per_head
     if dim_per_head is None:
-      dim_per_head = p.hidden_dim // p.num_heads
-      assert dim_per_head * p.num_heads == p.hidden_dim, (
-          f'{dim_per_head} * {p.num_heads} != {p.hidden_dim}')
+      dim_per_head = self.hidden_dim // self.num_heads
+      assert (
+          dim_per_head * self.num_heads == self.hidden_dim
+      ), f'{dim_per_head} * {self.num_heads} != {self.hidden_dim}'
 
-    if p.mesh_shape is not None:
-      assert p.weight_split_dims_mapping is not None
-      assert p.activation_split_dims_mapping is not None
+    if self.mesh_shape is not None:
+      assert self.weight_split_dims_mapping is not None
+      assert self.activation_split_dims_mapping is not None
 
-    if isinstance(p.input_dim, dict):
-      key_input_dim = p.input_dim['key']
-      value_input_dim = p.input_dim['value']
-      query_input_dim = p.input_dim['query']
+    if isinstance(self.input_dim, dict):
+      key_input_dim = self.input_dim['key']
+      value_input_dim = self.input_dim['value']
+      query_input_dim = self.input_dim['query']
       assert key_input_dim, f'key_input_dim is {key_input_dim}'
       assert query_input_dim, f'query_input_dim is {query_input_dim}'
     else:
-      key_input_dim = p.input_dim
-      value_input_dim = p.input_dim
-      query_input_dim = p.input_dim
+      key_input_dim = self.input_dim
+      value_input_dim = self.input_dim
+      query_input_dim = self.input_dim
 
     def project_input(input_dim):
-      proj_p = p.proj_tpl.clone().set(
+      proj_p = self.proj_tpl.clone().set(
           input_dim=input_dim,
-          num_heads=p.num_heads,
+          num_heads=self.num_heads,
           dim_per_head=dim_per_head,
-          use_bias=p.use_bias)
+          use_bias=self.use_bias,
+      )
       proj_p.weight_split_dims_mapping.wt = wp.proj
       return proj_p
 
     def project_input_no_heads(input_dim):
-      proj_p = p.headless_proj_tpl.clone().set(
-          input_dim=input_dim, output_dim=dim_per_head, use_bias=p.use_bias)
+      proj_p = self.headless_proj_tpl.clone().set(
+          input_dim=input_dim, output_dim=dim_per_head, use_bias=self.use_bias
+      )
       proj_p.weight_split_dims_mapping.wt = wp.proj_headless
       return proj_p
 
@@ -276,29 +269,31 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     self.create_child('query', project_input(query_input_dim))
     self.create_child('value', project_input_no_heads(value_input_dim))
 
-    if p.use_rotary_position_emb:
-      pos_emb_p = embedding_softmax.RotaryPositionalEmbedding.HParams()
+    if self.use_rotary_position_emb:
+      pos_emb_p = pax_fiddle.Config(embedding_softmax.RotaryPositionalEmbedding)
       pos_emb_p.embedding_dims = dim_per_head
       self.create_child('rotary_position_emb', pos_emb_p)
 
-    if p.relative_bias_tpl is not None:
-      relative_bias_p = p.relative_bias_tpl.clone()
-      relative_bias_p.num_heads = p.num_heads
+    if self.relative_bias_tpl is not None:
+      relative_bias_p = self.relative_bias_tpl.clone()
+      relative_bias_p.num_heads = self.num_heads
       self.create_child('relative_bias', relative_bias_p)
 
     self.create_child(
         'atten_dropout',
-        p.dropout_tpl.clone().set(keep_prob=1.0 - p.atten_dropout_prob))
+        self.dropout_tpl.clone().set(keep_prob=1.0 - self.atten_dropout_prob),
+    )
 
     # Setting is_output_projection=True to set the projection direction
     # from hidden dim to input dim. Output projection follows query_input_dim.
-    post_proj_p = p.proj_tpl.clone().set(
+    post_proj_p = self.proj_tpl.clone().set(
         input_dim=query_input_dim,
-        num_heads=p.num_heads,
+        num_heads=self.num_heads,
         dim_per_head=dim_per_head,
         is_output_projection=True,
-        use_bias=p.use_bias,
-        use_nhd_shape=p.output_proj_use_nhd_shape)
+        use_bias=self.use_bias,
+        use_nhd_shape=self.output_proj_use_nhd_shape,
+    )
     post_proj_p.weight_split_dims_mapping.wt = wp.proj
 
     self.create_child('post', post_proj_p)
@@ -314,59 +309,52 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     Returns:
       x with proper sharding annotations.
     """
-    p = self.hparams
-    ap = p.activation_split_dims_mapping
-    if p.mesh_axis_names is None:
+    ap = self.activation_split_dims_mapping
+    if self.mesh_axis_names is None:
       return x
     if ap.blnh is None:
       return x
     assert len(ap.blnh) == 4
     bnh = [ap.blnh[0], ap.blnh[2], ap.blnh[3]]
-    return base_layer.maybe_shard(x, bnh, p.mesh_axis_names)
+    return base_layer.maybe_shard(x, bnh, self.mesh_axis_names)
 
   def _shard_blnh(self, x: JTensor) -> JTensor:
     """Adds sharding annotations to tensors of shape [b, l, n, h]."""
-    p = self.hparams
-    ap = p.activation_split_dims_mapping
-    return base_layer.maybe_shard(x, ap.blnh, p.mesh_axis_names)
+    ap = self.activation_split_dims_mapping
+    return base_layer.maybe_shard(x, ap.blnh, self.mesh_axis_names)
 
   def _shard_blh(self, x: JTensor) -> JTensor:
     """Adds sharding annotations to tensors of shape [b, l, h]."""
-    p = self.hparams
-    ap = p.activation_split_dims_mapping
-    return base_layer.maybe_shard(x, ap.blh, p.mesh_axis_names)
+    ap = self.activation_split_dims_mapping
+    return base_layer.maybe_shard(x, ap.blh, self.mesh_axis_names)
 
   def _shard_bld(self, x: JTensor) -> JTensor:
     """Adds sharding annotations to tensors of shape [b, l, d]."""
-    p = self.hparams
-    ap = p.activation_split_dims_mapping
-    return base_layer.maybe_shard(x, ap.bld, p.mesh_axis_names)
+    ap = self.activation_split_dims_mapping
+    return base_layer.maybe_shard(x, ap.bld, self.mesh_axis_names)
 
   def _shard_bd(self, x: JTensor) -> JTensor:
     """Adds sharding annotations to tensors of shape [b, d]."""
-    p = self.hparams
-    ap = p.activation_split_dims_mapping
-    if p.mesh_axis_names is None:
+    ap = self.activation_split_dims_mapping
+    if self.mesh_axis_names is None:
       return x
     if ap.bld is None:
       return x
     assert len(ap.bld) == 3
     bd = [ap.bld[0], ap.bld[2]]
-    return base_layer.maybe_shard(x, bd, p.mesh_axis_names)
+    return base_layer.maybe_shard(x, bd, self.mesh_axis_names)
 
   def _scale_query(self, query: JTensor) -> JTensor:
     """Scales the query vector if enabled."""
-    p = self.hparams
-    if p.internal_enable_query_scale:
-      query *= (p.hidden_dim // p.num_heads)**-0.5
+    if self.internal_enable_query_scale:
+      query *= (self.hidden_dim // self.num_heads) ** -0.5
     return query
 
   def _cap_logits(self, logits: JTensor) -> JTensor:
     """When enabled, caps the logits by p.atten_logit_cap with tanh."""
-    p = self.hparams
-    if not p.atten_logit_cap or p.atten_logit_cap <= 0.:
+    if not self.atten_logit_cap or self.atten_logit_cap <= 0.0:
       return logits
-    cap = jnp.array(p.atten_logit_cap, dtype=logits.dtype)
+    cap = jnp.array(self.atten_logit_cap, dtype=logits.dtype)
     # Note that since this caps the negative side as well, caller
     # must defer the pad-with-very-negative-logits logic to after
     # this function returns.
@@ -387,7 +375,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     """
     # Applies stop_gradient to max_logit instead of logits.
     max_logit = jnp.max(jax.lax.stop_gradient(logits), axis=-1, keepdims=True)
-    extra_logit = self.hparams.attention_extra_logit
+    extra_logit = self.attention_extra_logit
     if extra_logit is not None:
       extra_logit = jnp.asarray(extra_logit, dtype=max_logit.dtype)
       max_logit = jnp.maximum(max_logit, extra_logit)
@@ -427,8 +415,6 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       encoded: JTensor of shape [B, T, N, H].
       atten_probs: JTensor of shape [B, N, T, S].
     """
-    # Add key sharding annotations.
-    p = self.hparams
     query = self._shard_blnh(query)
     key = self._shard_blh(key)
     value = self._shard_blh(value)
@@ -457,7 +443,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     logits = logits.astype(jnp.float32)
     # Apply attention masking
     padded_logits = logits + atten_mask.astype(jnp.float32)
-    if p.attention_extra_logit is None:
+    if self.attention_extra_logit is None:
       probs = jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
     else:
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
@@ -498,8 +484,6 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       encoded: JTensor of shape [B, N, H].
       probs: JTensor of shape [B, N, S].
     """
-
-    p = self.hparams
     key = self._shard_blh(self.get_decode_state(key_state_name))
     value = self._shard_blh(self.get_decode_state(value_state_name))
     # query is 3d.
@@ -523,7 +507,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     # Apply attention masking
     padded_logits = logits + atten_mask.astype(jnp.float32)
     # Of shape [b, n, s]
-    if p.attention_extra_logit is None:
+    if self.attention_extra_logit is None:
       probs = jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
     else:
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
@@ -559,7 +543,6 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       encoded: JTensor of shape [B, T, D].
       atten_probs: JTensor of shape [B, N, T, S].
     """
-    p = self.hparams
     # Project inputs to key, value and query, respectively has shape
     # [B, S, N, H], [B, S, H], and [B, T, H].
     query_proj = self.query(query_vec)
@@ -571,7 +554,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
 
     # Apply rotary position embeddings.
     # Paper: https://arxiv.org/abs/2104.09864.
-    if p.use_rotary_position_emb:
+    if self.use_rotary_position_emb:
       query_proj = self.rotary_position_emb(query_proj, query_segment_pos)
       key_shape = key_proj.shape
       # [B, S, H] -> [B, S, N(1), H]
@@ -582,7 +565,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
 
     # Apply relative bias.
     # Paper: https://aclanthology.org/N18-2074.pdf.
-    if p.relative_bias_tpl:
+    if self.relative_bias_tpl:
       relative_bias = self.relative_bias(query_segment_pos, key_segment_pos)
     else:
       relative_bias = None
@@ -668,7 +651,6 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       encoded: JTensor of shape [B, D] which returns the attention output at
         `time_step`.
     """
-    p = self.hparams
     time_step = jnp.array(time_step)
     # Batch major.
     time_dim = 1
@@ -692,7 +674,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     key_state_name = 'key_state'
     _extend_decode_state_and_shard_blh(key_state_name, new_key_proj)
 
-    if p.use_rotary_position_emb:
+    if self.use_rotary_position_emb:
       if segment_pos is None:
         position = jnp.broadcast_to(time_step, [query_vec.shape[0]])
       else:
@@ -707,7 +689,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       key_state_name = 'key_post_rotary_pos_emb'
       _extend_decode_state_and_shard_blh(key_state_name, new_key_proj)
 
-    if p.relative_bias_tpl:
+    if self.relative_bias_tpl:
       # Relative bias uses time_step instead of segment_pos.
       relative_bias = self.relative_bias.extend_step(
           seq_length=self.decoding_state_sequence_length(), time_step=time_step)

@@ -19,6 +19,7 @@ import jax
 from jax import numpy as jnp
 from praxis import asserts
 from praxis import base_layer
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
 
@@ -28,8 +29,6 @@ WeightHParams = base_layer.WeightHParams
 
 Params = py_utils.HParams
 JTensor = pytypes.JTensor
-
-BaseHParams = base_layer.BaseLayer.HParams
 
 
 def _zoneout_helper(prev_v: JTensor, cur_v: JTensor, padding_v: JTensor,
@@ -143,41 +142,37 @@ class LstmCellSimple(BaseRnnCell):
   - padding: the padding. [batch, 1].
   - reset_mask: optional 0/1 float input to support packed input training.
     Shape [batch, 1]
+
+  Attributes:
+    inputs_arity: Number of tensors expected for the inputs.act field.
+    num_input_nodes: Number of input nodes.
+    num_output_nodes: Number of output nodes. If num_hidden_nodes is 0, also
+      used as cell size.
+    num_hidden_nodes: Number of projection hidden nodes (see
+      https://arxiv.org/abs/1603.08042). Set to 0 to disable projection.
+    reset_cell_state: Set True to support resetting cell state in scenarios
+      where multiple inputs are packed into a single training example. The RNN
+      layer should provide reset_mask inputs in addition to act and padding if
+      this flag is set.
+    cell_value_cap: Cell values are capped to be within [-cell_value_cap,
+      +cell_value_cap] if the value is not None. It can be a scalar, a scalar
+      tensor or None. When set to None, no capping is applied.
+    forget_gate_bias: Bias to apply to the forget gate.
+    output_nonlinearity: Whether or not to apply tanh non-linearity on lstm
+      output.
+    zo_prob: If > 0, applies ZoneOut regularization with the given prob.
+    bias_init: Initialization parameters for bias.
   """
-
-  class HParams(BaseRnnCell.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      inputs_arity: Number of tensors expected for the inputs.act field.
-      num_input_nodes: Number of input nodes.
-      num_output_nodes: Number of output nodes. If num_hidden_nodes is 0, also
-        used as cell size.
-      num_hidden_nodes: Number of projection hidden nodes (see
-        https://arxiv.org/abs/1603.08042). Set to 0 to disable projection.
-      reset_cell_state: Set True to support resetting cell state in scenarios
-        where multiple inputs are packed into a single training example. The RNN
-        layer should provide reset_mask inputs in addition to act and padding if
-        this flag is set.
-      cell_value_cap: Cell values are capped to be within [-cell_value_cap,
-        +cell_value_cap] if the value is not None. It can be a scalar, a scalar
-        tensor or None. When set to None, no capping is applied.
-      forget_gate_bias: Bias to apply to the forget gate.
-      output_nonlinearity: Whether or not to apply tanh non-linearity on lstm
-        output.
-      zo_prob: If > 0, applies ZoneOut regularization with the given prob.
-      bias_init: Initialization parameters for bias.
-    """
-    inputs_arity: int = 1
-    num_input_nodes: int = 0
-    num_output_nodes: int = 0
-    num_hidden_nodes: int = 0
-    reset_cell_state: bool = False
-    cell_value_cap: float = 10.0
-    forget_gate_bias: float = 0.0
-    output_nonlinearity: bool = True
-    zo_prob: float = 0.0
-    bias_init: WeightInit = WeightInit.Constant(0.0)
+  inputs_arity: int = 1
+  num_input_nodes: int = 0
+  num_output_nodes: int = 0
+  num_hidden_nodes: int = 0
+  reset_cell_state: bool = False
+  cell_value_cap: float = 10.0
+  forget_gate_bias: float = 0.0
+  output_nonlinearity: bool = True
+  zo_prob: float = 0.0
+  bias_init: WeightInit = WeightInit.Constant(0.0)
 
   @property
   def num_gates(self) -> int:
@@ -185,30 +180,33 @@ class LstmCellSimple(BaseRnnCell):
 
   @property
   def output_size(self) -> int:
-    return self.hparams.num_output_nodes
+    return self.num_output_nodes
 
   @property
   def hidden_size(self) -> int:
-    return self.hparams.num_hidden_nodes or self.hparams.num_output_nodes
+    return self.num_hidden_nodes or self.num_output_nodes
 
   def setup(self) -> None:
     """Initializes LSTMCellSimple."""
-    p = self.hparams
-    if p.cell_value_cap is not None:
-      asserts.instance(p.cell_value_cap, (int, float))
+    if self.cell_value_cap is not None:
+      asserts.instance(self.cell_value_cap, (int, float))
 
     # Define weights.
-    wm_pc = WeightHParams(shape=[
-        p.num_input_nodes + self.output_size, self.num_gates * self.hidden_size
-    ])
+    wm_pc = WeightHParams(
+        shape=[
+            self.num_input_nodes + self.output_size,
+            self.num_gates * self.hidden_size,
+        ]
+    )
     self.create_variable('wm', wm_pc)
 
-    if p.num_hidden_nodes:
+    if self.num_hidden_nodes:
       w_proj = WeightHParams(shape=[self.hidden_size, self.output_size])
       self.create_variable('w_proj', w_proj)
 
     bias_pc = WeightHParams(
-        shape=[self.num_gates * self.hidden_size], init=p.bias_init)
+        shape=[self.num_gates * self.hidden_size], init=self.bias_init
+    )
     self.create_variable('b', bias_pc)
 
   def init_states(self, batch_size: int) -> NestedMap:
@@ -247,13 +245,12 @@ class LstmCellSimple(BaseRnnCell):
     Returns:
       state1: The next recurrent state.
     """
-    p = self.hparams
     inputs = jax.tree_map(lambda x: x, inputs)
     if not isinstance(inputs.act, (list, tuple)):
       inputs.act = [inputs.act]
-    asserts.eq(self.hparams.inputs_arity, len(inputs.act))
+    asserts.eq(self.inputs_arity, len(inputs.act))
 
-    if p.reset_cell_state:
+    if self.reset_cell_state:
       state0 = self._reset_state(state0, inputs)
 
     concat = jnp.concatenate(inputs.act + [state0.m], 1)
@@ -265,31 +262,31 @@ class LstmCellSimple(BaseRnnCell):
     return state1
 
   def _bias_adjustment(self) -> JTensor:
-    p = self.hparams
     bias = self.theta.b
-    if p.forget_gate_bias != 0.0:
-      adjustment = (
-          jnp.ones([self.num_gates, self.hidden_size]) *
-          jnp.expand_dims(jnp.array([0., 0., p.forget_gate_bias, 0.]), axis=1))
+    if self.forget_gate_bias != 0.0:
+      adjustment = jnp.ones(
+          [self.num_gates, self.hidden_size]
+      ) * jnp.expand_dims(
+          jnp.array([0.0, 0.0, self.forget_gate_bias, 0.0]), axis=1
+      )
       adjustment = jnp.reshape(adjustment, [self.num_gates * self.hidden_size])
       bias += adjustment
     return bias
 
   def _gates_internal(self, state0: NestedMap, i_i: JTensor, i_g: JTensor,
                       f_g: JTensor, o_g: JTensor) -> NestedMap:
-    p = self.hparams
     forget_gate = jax.nn.sigmoid(f_g) * state0.c
     input_gate = jax.nn.sigmoid(i_g) * jnp.tanh(i_i)
     new_c = forget_gate + input_gate
     # Clip the cell states to reasonable value.
-    if p.cell_value_cap is not None:
-      new_c = jnp.clip(new_c, -p.cell_value_cap, p.cell_value_cap)
+    if self.cell_value_cap is not None:
+      new_c = jnp.clip(new_c, -self.cell_value_cap, self.cell_value_cap)
 
-    if p.output_nonlinearity:
+    if self.output_nonlinearity:
       new_m = jax.nn.sigmoid(o_g) * jnp.tanh(new_c)
     else:
       new_m = jax.nn.sigmoid(o_g) * new_c
-    if p.num_hidden_nodes:
+    if self.num_hidden_nodes:
       new_m = jnp.einsum('bd,dc->bc', new_m, self.theta.w_proj)
 
     return NestedMap(c=new_c, m=new_m)
@@ -297,9 +294,8 @@ class LstmCellSimple(BaseRnnCell):
   def _apply_zoneout(self, state0: NestedMap, inputs: NestedMap,
                      state1: NestedMap) -> NestedMap:
     """Apply Zoneout and returns the updated states."""
-    p = self.hparams
 
-    if p.zo_prob > 0.0:
+    if self.zo_prob > 0.0:
       c_random_uniform = jax.random.uniform(self.next_prng_key(),
                                             state0.c.shape)
       m_random_uniform = jax.random.uniform(self.next_prng_key(),
@@ -308,10 +304,22 @@ class LstmCellSimple(BaseRnnCell):
       c_random_uniform = None
       m_random_uniform = None
 
-    new_c = _zoneout_helper(state0.c, state1.c, inputs.padding, p.zo_prob,
-                            self.do_eval, c_random_uniform)
-    new_m = _zoneout_helper(state0.m, state1.m, inputs.padding, p.zo_prob,
-                            self.do_eval, m_random_uniform)
+    new_c = _zoneout_helper(
+        state0.c,
+        state1.c,
+        inputs.padding,
+        self.zo_prob,
+        self.do_eval,
+        c_random_uniform,
+    )
+    new_m = _zoneout_helper(
+        state0.m,
+        state1.m,
+        inputs.padding,
+        self.zo_prob,
+        self.do_eval,
+        m_random_uniform,
+    )
 
     return NestedMap(m=new_m, c=new_c)
 
@@ -333,7 +341,7 @@ class LstmCellSimple(BaseRnnCell):
     else:
       x = act[0]
     # [T, B, 4 * H]
-    num_input_nodes = self.hparams.num_input_nodes
+    num_input_nodes = self.num_input_nodes
     assert num_input_nodes == x.shape[-1]
     wm_i = self.theta.wm[:num_input_nodes, :]
 
@@ -374,11 +382,10 @@ class LstmCellSimple(BaseRnnCell):
     Returns:
       state1: A NestedMap of the same structure as `state0`.
     """
-    p = self.hparams
-    if p.reset_cell_state:
+    if self.reset_cell_state:
       state0 = self._reset_state(state0, inputs)
 
-    num_input_nodes = self.hparams.num_input_nodes
+    num_input_nodes = self.num_input_nodes
     wm_h = self.theta.wm[num_input_nodes:, :]
     proj_m = jnp.einsum('bd,dc->bc', state0.m, wm_h)
     xmw = inputs.proj_inputs + proj_m
@@ -386,6 +393,64 @@ class LstmCellSimple(BaseRnnCell):
     xmw += self._bias_adjustment()
     i_i, i_g, f_g, o_g = jnp.split(xmw, self.num_gates, axis=1)
 
+    state1 = self._gates_internal(state0, i_i, i_g, f_g, o_g)
+    state1 = self._apply_zoneout(state0, inputs, state1)
+    return state1
+
+
+class LayerNormalizedLstmCellSimple(LstmCellSimple):
+  """An implementation of layer normalized LSTM based on LSTMCellSimple.
+
+  Implements normalization scheme as described in
+  https://arxiv.org/pdf/1607.06450.pdf
+
+  Attributes:
+    layer_norm_epsilon: A small float added to variance.
+  """
+  layer_norm_epsilon: float = 1e-8
+
+  def setup(self) -> None:
+    """Initializes LayerNormalizedLstmCellSimple."""
+    super().setup()
+    ln_scale_pc = WeightHParams(
+        shape=[self.num_gates * self.hidden_size],
+        init=WeightInit.Constant(1.0))
+    self.create_variable('ln_scale', ln_scale_pc)
+
+  def __call__(self, state0: NestedMap, inputs: NestedMap) -> NestedMap:
+    """Forward function.
+
+    The only difference to base class is a LayerNorm applied before gating. Also
+    see base class docstrings.
+
+    Args:
+      state0: The previous recurrent state.
+      inputs: The inputs to the cell.
+
+    Returns:
+      state1: The next recurrent state.
+    """
+    inputs = jax.tree_map(lambda x: x, inputs)
+    if not isinstance(inputs.act, (list, tuple)):
+      inputs.act = [inputs.act]
+    asserts.eq(self.inputs_arity, len(inputs.act))
+
+    if self.reset_cell_state:
+      state0 = self._reset_state(state0, inputs)
+
+    concat = jnp.concatenate(inputs.act + [state0.m], 1)
+    xmw = jnp.einsum('bd,dc->bc', concat, self.theta.wm)
+    b = xmw.shape[0]
+    xmw_reshape = jnp.reshape(xmw, [b, self.num_gates, -1])
+    xmw_mean = jnp.mean(xmw_reshape, axis=2, keepdims=True)
+    xmw_variance = jnp.mean(
+        jnp.square(xmw_reshape - xmw_mean), axis=2, keepdims=True)
+    xmw_normed = (xmw_reshape - xmw_mean) * jax.lax.rsqrt(
+        xmw_variance + self.layer_norm_epsilon
+    )
+    xmw = jnp.reshape(xmw_normed, [b, -1]) * self.theta.ln_scale
+    xmw += self._bias_adjustment()
+    i_i, i_g, f_g, o_g = jnp.split(xmw, self.num_gates, axis=1)
     state1 = self._gates_internal(state0, i_i, i_g, f_g, o_g)
     state1 = self._apply_zoneout(state0, inputs, state1)
     return state1
@@ -410,22 +475,21 @@ class CifgLstmCellSimple(LstmCellSimple):
     Returns:
       state1: The next recurrent state.
     """
-    p = self.hparams
-    p: CifgLstmCellSimple.HParams
+    p: pax_fiddle.Config[CifgLstmCellSimple]
 
     inputs = jax.tree_map(lambda x: x, inputs)
     if not isinstance(inputs.act, (list, tuple)):
       inputs.act = [inputs.act]
 
-    asserts.eq(self.hparams.inputs_arity, len(inputs.act))
+    asserts.eq(self.inputs_arity, len(inputs.act))
 
-    if p.reset_cell_state:
+    if self.reset_cell_state:
       state0 = self._reset_state(state0, inputs)
 
     concat = jnp.concatenate(inputs.act + [state0.m], 1)
     xmw = jnp.einsum('bd,dc->bc', concat, self.theta.wm)
     # CifgLstmCellSimple doesn't support forget gate bias.
-    assert p.forget_gate_bias == 0.0
+    assert self.forget_gate_bias == 0.0
     xmw += self.theta.b
     i_i, f_g, o_g = jnp.split(xmw, self.num_gates, axis=1)
     state1 = self._gates_internal(state0, i_i, f_g, o_g)
@@ -434,20 +498,19 @@ class CifgLstmCellSimple(LstmCellSimple):
 
   def _gates_internal(self, state0: NestedMap, i_i: JTensor, f_g: JTensor,
                       o_g: JTensor) -> NestedMap:
-    p = self.hparams
     forget_gate = jax.nn.sigmoid(f_g) * state0.c
     # Coupled input and forget gate.
     input_gate = (1.0 - jax.nn.sigmoid(f_g)) * jnp.tanh(i_i)
     new_c = forget_gate + input_gate
     # Clip the cell states to reasonable value.
-    if p.cell_value_cap is not None:
-      new_c = jnp.clip(new_c, -p.cell_value_cap, p.cell_value_cap)
+    if self.cell_value_cap is not None:
+      new_c = jnp.clip(new_c, -self.cell_value_cap, self.cell_value_cap)
 
-    if p.output_nonlinearity:
+    if self.output_nonlinearity:
       new_m = jax.nn.sigmoid(o_g) * jnp.tanh(new_c)
     else:
       new_m = jax.nn.sigmoid(o_g) * new_c
-    if p.num_hidden_nodes:
+    if self.num_hidden_nodes:
       new_m = jnp.einsum('bd,dc->bc', new_m, self.theta.w_proj)
 
     return NestedMap(c=new_c, m=new_m)
@@ -469,17 +532,16 @@ class CifgLstmCellSimple(LstmCellSimple):
     Returns:
       state1: A NestedMap of the same structure as `state0`.
     """
-    p = self.hparams
-    if p.reset_cell_state:
+    if self.reset_cell_state:
       state0 = self._reset_state(state0, inputs)
 
-    num_input_nodes = self.hparams.num_input_nodes
+    num_input_nodes = self.num_input_nodes
     wm_h = self.theta.wm[num_input_nodes:, :]
     proj_m = jnp.einsum('bd,dc->bc', state0.m, wm_h)
     xmw = inputs.proj_inputs + proj_m
 
     # CifgLstmCellSimple doesn't support forget gate bias.
-    assert p.forget_gate_bias == 0.0
+    assert self.forget_gate_bias == 0.0
 
     xmw += self.theta.b
     i_i, f_g, o_g = jnp.split(xmw, self.num_gates, axis=1)

@@ -15,7 +15,7 @@
 
 """Definition of specific models."""
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from absl import logging
 import clu.metrics as clu_metrics
@@ -54,9 +54,9 @@ FlatBeamSearchHParams = decoder_hparams.FlatBeamSearchHParams
 SampleDecoderHParams = decoder_hparams.SampleDecoderHParams
 GreedyDecoderHParams = decoder_hparams.GreedyDecoderHParams
 LanguageModelType = transformer_models.LanguageModelType
-
-BaseHParams = base_layer.BaseLayer.HParams
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 sub_config_field = base_layer.sub_config_field
+template_field = base_layer.template_field
 
 
 def _merge_per_token_and_per_example_weights(
@@ -148,48 +148,41 @@ def compute_xent_loss_helper(
 
 
 class LanguageModel(base_model.BaseModel):
-  """Language Model base task."""
+  """Language Model base task.
 
-  class HParams(base_model.BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      lm_tpl: LM layer.
-      return_predictions: Whether to return predictions during eval. Returning
-        predictions is more expensive, but may be useful for debugging.
-      decoder_tpl: Parameterization of the decoder.
-      model_type: The type of language model based on the tokens visibility.
-      count_tokens: Whether to track total tokens trained on in the checkpoint.
-      apply_eval_sample_weights: Boolean indicating whether to apply the per
-        example weights from the input `eval_sample_weights` or not.
-    """
-    lm_tpl: BaseHParams = sub_config_field(
-        transformer_models.TransformerLm.HParams)
-    return_predictions: bool = False
-    decoder_tpl: DecoderHParams = pax_fiddle.sub_field(
-        GreedyDecoderHParams)
-    model_type: LanguageModelType = LanguageModelType.CAUSAL
-    count_tokens: bool = False
-    apply_eval_sample_weights: bool = False
+  Attributes:
+    lm_tpl: LM layer.
+    return_predictions: Whether to return predictions during eval. Returning
+      predictions is more expensive, but may be useful for debugging.
+    decoder_tpl: Parameterization of the decoder.
+    model_type: The type of language model based on the tokens visibility.
+    count_tokens: Whether to track total tokens trained on in the checkpoint.
+    apply_eval_sample_weights: Boolean indicating whether to apply the per
+      example weights from the input `eval_sample_weights` or not.
+  """
+  lm_tpl: LayerTpl = template_field(transformer_models.TransformerLm)
+  return_predictions: bool = False
+  decoder_tpl: DecoderHParams = base_layer.instance_field(GreedyDecoderHParams)
+  model_type: LanguageModelType = LanguageModelType.CAUSAL
+  count_tokens: bool = False
+  apply_eval_sample_weights: bool = False
 
   def setup(self) -> None:
     super().setup()
-    p = self.hparams
 
-    if p.count_tokens:
-      tc_p = embedding_softmax.TokenCounter.HParams()
+    if self.count_tokens:
+      tc_p = pax_fiddle.Config(embedding_softmax.TokenCounter)
       self.create_child('token_counter', tc_p)
 
     # Construct the model.
-    lm_p = p.lm_tpl.clone()
-    lm_p.model_type = p.model_type
+    lm_p = self.lm_tpl.clone()
+    lm_p.model_type = self.model_type
     self.create_child('lm', lm_p)
 
   def _prepare_predict_data(self, input_batch: NestedMap) -> NestedMap:
-    p = self.hparams
     paddings = input_batch.paddings
     weights = input_batch.weights
-    if p.apply_eval_sample_weights:
+    if self.apply_eval_sample_weights:
       if not hasattr(input_batch, 'eval_sample_weights'):
         logging.warning(
             '`apply_eval_sample_weights` enabled, but the input batch does not '
@@ -197,20 +190,20 @@ class LanguageModel(base_model.BaseModel):
       weights = _merge_per_token_and_per_example_weights(
           weights, input_batch.eval_sample_weights)
     inputs = input_batch.ids
-    if p.count_tokens:
+    if self.count_tokens:
       self.token_counter(inputs, paddings)
     labels = NestedMap(class_ids=input_batch.labels, class_weights=weights)
 
     extra_input_kwargs = {}
-    if p.lm_tpl.packed_input:
+    if self.lm_tpl.packed_input:
       extra_input_kwargs = {
           'segment_ids': input_batch.segment_ids,
           'segment_pos': input_batch.segment_pos,
       }
 
-    if p.model_type == LanguageModelType.BIDIRECTIONAL:
+    if self.model_type == LanguageModelType.BIDIRECTIONAL:
       causal_attention_mask = jnp.zeros_like(inputs)
-    elif p.model_type == LanguageModelType.PREFIX:
+    elif self.model_type == LanguageModelType.PREFIX:
       causal_attention_mask = 1 - input_batch.inputs_indicator
     else:
       causal_attention_mask = None
@@ -246,13 +239,19 @@ class LanguageModel(base_model.BaseModel):
         training example, where the first dimension of each tensor is the batch
         index.
     """
-    p = self.hparams
-    return compute_xent_loss_helper(predictions, input_batch,
-                                    p.return_predictions,
-                                    p.apply_eval_sample_weights)
+    return compute_xent_loss_helper(
+        predictions,
+        input_batch,
+        self.return_predictions,
+        self.apply_eval_sample_weights,
+    )
 
-  def _prepare_decode_data(self, input_batch: NestedMap) -> NestedMap:
-    p = self.hparams
+  def _prepare_guidance_decode_data(self, decode_data: NestedMap) -> NestedMap:
+    raise NotImplementedError('LanguageModel does not support guidance.')
+
+  def _prepare_decode_data(
+      self, input_batch: NestedMap, decoder_params: DecoderHParams
+  ) -> NestedMap:
     batch_size = input_batch.ids.shape[0]
 
     # TODO(b/229679837): unify prefix_lengths logic to depend on
@@ -260,7 +259,7 @@ class LanguageModel(base_model.BaseModel):
     # Get prefix_lengths from inputs_indicator or paddings.
     if 'prefix_lengths' in input_batch:
       prefix_lengths = input_batch.prefix_lengths
-    elif p.model_type == transformer_models.LanguageModelType.PREFIX:
+    elif self.model_type == transformer_models.LanguageModelType.PREFIX:
       asserts.eq(('inputs_indicator' in input_batch),
                  True,
                  msg='inputs_indicator should be in input batch for prefix LM.')
@@ -271,14 +270,14 @@ class LanguageModel(base_model.BaseModel):
       # Note that computing the sum with bf16 is not precise enough, so convert
       # paddings to integers first.
       maxval = jnp.sum(1 - input_batch.paddings.astype(jnp.int32), axis=1)
-      minval = jnp.minimum(maxval, p.decoder_tpl.min_prefix_len)
+      minval = jnp.minimum(maxval, decoder_params.min_prefix_len)
       prefix_lengths = jax.random.randint(self.next_prng_key(), [batch_size],
                                           minval, maxval + 1,
                                           input_batch.ids.dtype)
 
-    if p.model_type == LanguageModelType.BIDIRECTIONAL:
+    if self.model_type == LanguageModelType.BIDIRECTIONAL:
       raise NotImplementedError(type(self))
-    elif p.model_type == LanguageModelType.PREFIX:
+    elif self.model_type == LanguageModelType.PREFIX:
       if 'inputs_indicator' in input_batch:
         causal_attention_mask = 1 - input_batch.inputs_indicator
       else:
@@ -289,9 +288,20 @@ class LanguageModel(base_model.BaseModel):
       causal_attention_mask = None
 
     max_prefix_len = input_batch.ids.shape[1]
-    if p.decoder_tpl.fprop_for_prefix:
-      asserts.not_none(p.decoder_tpl.max_decode_steps)
-      seqlen = max_prefix_len + p.decoder_tpl.max_decode_steps
+    if decoder_params.fprop_for_prefix:
+      asserts.not_none(decoder_params.max_decode_steps)
+      max_decode_steps = decoder_params.max_decode_steps
+      last_max_decode_steps = (
+          max(max_decode_steps)
+          if isinstance(max_decode_steps, Sequence)
+          else max_decode_steps
+      )
+      first_max_decode_steps = (
+          min(max_decode_steps)
+          if isinstance(max_decode_steps, Sequence)
+          else max_decode_steps
+      )
+      seqlen = max_prefix_len + last_max_decode_steps
       start_time_step = max_prefix_len - 1
       # Change prefix to be right-aligned.
       fprop_input_ids, fprop_input_paddings = (
@@ -305,19 +315,23 @@ class LanguageModel(base_model.BaseModel):
           jnp.arange(max_prefix_len) <
           (max_prefix_len - prefix_lengths)[:, jnp.newaxis],
           jnp.zeros_like(fprop_segment_pos), jnp.ones_like(fprop_segment_pos))
-      state_padding_size = p.decoder_tpl.max_decode_steps
+      state_padding_size = first_max_decode_steps
       # Init input ids and paddings for extend_step.
-      input_ids = jnp.pad(fprop_input_ids,
-                          [[0, 0], [0, p.decoder_tpl.max_decode_steps]])
+      input_ids = jnp.pad(
+          fprop_input_ids,
+          [[0, 0], [0, first_max_decode_steps]],
+      )
       input_paddings = jnp.pad(
-          fprop_input_paddings, [[0, 0], [0, p.decoder_tpl.max_decode_steps]],
-          constant_values=1.)
+          fprop_input_paddings,
+          [[0, 0], [0, first_max_decode_steps]],
+          constant_values=1.0,
+      )
       if causal_attention_mask is not None:
         # Pad 1 to the left of causal_attention_mask.
         causal_attention_mask = decoder_utils.right_align_tensors(
             causal_attention_mask, prefix_lengths)
     else:
-      seqlen = p.decoder_tpl.seqlen
+      seqlen = decoder_params.seqlen
       start_time_step = 0
       input_ids = input_batch.ids
       input_paddings = input_batch.paddings
@@ -327,7 +341,7 @@ class LanguageModel(base_model.BaseModel):
       fprop_segment_ids = None
       state_padding_size = seqlen - 1
 
-    return NestedMap(
+    decode_data = NestedMap(
         seqlen=seqlen,
         start_time_step=start_time_step,
         input_ids=input_ids,
@@ -342,10 +356,19 @@ class LanguageModel(base_model.BaseModel):
         extra_input_kwargs={},
     )
 
-  def decode(self,
-             input_batch: NestedMap,
-             return_result_for_suffix_score=False) -> DecodeOut:
-    """Greedy decodes the input_batch.
+    if (template_has_type(decoder_params, SampleDecoderHParams) and
+        decoder_params.cf_guidance_scale is not None):
+      decode_data = self._prepare_guidance_decode_data(decode_data)
+
+    return decode_data
+
+  def decode(
+      self,
+      input_batch: NestedMap,
+      result_callback: Optional[decoder_utils.StreamingResultCallback] = None,
+      return_result_for_suffix_score=False,
+  ) -> DecodeOut:
+    """Decodes the input_batch with specified decoder params.
 
     Args:
       input_batch: The input batch, with fields `.ids` and `.paddings`. It may
@@ -354,7 +377,11 @@ class LanguageModel(base_model.BaseModel):
         suffix_ids with shape [num_suffix, suffix_length]. Optional
         `.temperature` of shape [batch_size] has the temperature for each
         example. If `.temperature` is not set in the input_batch,
-        p.decoder_tpl.temperature will be used in sampling decode.
+        p.decoder_tpl.temperature will be used in sampling decode. Optional
+        `.per_example_max_decode_steps` of shape [batch_size] has the maximum
+        decoding steps for each example.
+      result_callback: Optional callback function to be called for intermediate
+        decoding results.
       return_result_for_suffix_score: Whether return results for suffix score.
 
     Returns:
@@ -371,28 +398,66 @@ class LanguageModel(base_model.BaseModel):
         [batch, num_samples, num_suffix, seq_len].
       - A dict of [str, clu_metrics.Metric] objects with metric objects.
     """
-    p = self.hparams
-    if not isinstance(p.decoder_tpl, DecoderHParams):
-      raise ValueError('p.decoder_tpl must be DecoderHParams type, but it is a '
-                       f'type of {type(p.decoder_tpl)}')
-    if p.decoder_tpl.seqlen <= 0:
-      raise ValueError('Must set p.decoder_tpl.seqlen > 0, current value = '
-                       f'{p.decoder_tpl.seqlen}')
+    if not isinstance(self.decoder_tpl, DecoderHParams):
+      raise ValueError(
+          'p.decoder_tpl must be DecoderHParams type, but it is a '
+          f'type of {type(self.decoder_tpl)}'
+      )
+    return self.decode_with_params(
+        self.decoder_tpl,
+        input_batch,
+        result_callback=result_callback,
+        return_result_for_suffix_score=return_result_for_suffix_score,
+    )
+
+  def decode_with_params(
+      self,
+      decoder_params: DecoderHParams,
+      input_batch: NestedMap,
+      result_callback: Optional[decoder_utils.StreamingResultCallback] = None,
+      return_result_for_suffix_score=False,
+  ) -> DecodeOut:
+    """Same as decode but with specified DecoderHParams."""
+    if decoder_params.seqlen <= 0:
+      raise ValueError(
+          'Must set p.decoder_tpl.seqlen > 0, current value = '
+          f'{decoder_params.seqlen}'
+      )
     max_prefix_len = input_batch.ids.shape[1]
-    decode_data = self._prepare_decode_data(input_batch)
+    decode_data = self._prepare_decode_data(input_batch, decoder_params)
+
+    decode_mesh_transpose = decoder_params.decode_loop_mesh_axes_transpose
+    if decode_mesh_transpose:
+      lm_var_hparams = self.lm.abstract_init_with_metadata(
+          decode_data.fprop_input_ids,
+          decode_data.fprop_input_paddings,
+          segment_ids=decode_data.fprop_segment_ids,
+          segment_pos=decode_data.fprop_segment_pos,
+          start_time_step=decode_data.start_time_step,
+          causal_attention_mask=decode_data.causal_attention_mask,
+          **decode_data.extra_input_kwargs,
+      )
+
+      lm_var_pspecs = base_layer.var_partition_specs(
+          lm_var_hparams, self.lm.mesh_shape, self.lm.mesh_axis_names
+      )
+    else:
+      lm_var_pspecs = None
+    logging.info('decode_mesh_transpose: %s', decode_mesh_transpose)
 
     def extend_step_fn(mdl, ids, segment_pos):
-      xent = mdl.lm.extend_step(ids, segment_pos=segment_pos)
+      xent = mdl.extend_step(ids, segment_pos=segment_pos)
       return xent.logits
 
     def transform_decode_state_fn(mdl, transform_fn):
-      mdl.lm.transform_decode_state(transform_fn)
+      mdl.transform_decode_state(transform_fn)
 
     def lazy_broadcast_prefix_fn(mdl, num_suffix_samples, suffix_length):
-      mdl.lm.lazy_broadcast_prefix(num_suffix_samples, suffix_length)
+      mdl.lazy_broadcast_prefix(num_suffix_samples, suffix_length)
 
     # Flat beam search doesn't work yet.
-    if template_has_type(p.decoder_tpl, FlatBeamSearchHParams):
+    if template_has_type(decoder_params, FlatBeamSearchHParams):
+      assert isinstance(decoder_params, FlatBeamSearchHParams)
       # Init cache states.
       self.lm(
           decode_data.fprop_input_ids,
@@ -403,39 +468,59 @@ class LanguageModel(base_model.BaseModel):
           causal_attention_mask=decode_data.causal_attention_mask,
           **decode_data.extra_input_kwargs
       )
-      # Pad to full-sequence length.
-      self.lm.transform_decode_state(
-          decoder_utils.pad_state_fn(decode_data.state_padding_size))
-      result = flat_beam_search.flat_beam_search(
-          self,
-          extend_step_fn,
-          decode_data.input_ids,
-          decode_data.input_paddings,
-          decode_data.seqlen,
-          beam_size=p.decoder_tpl.beam_size,
-          fprop_dtype=self.fprop_dtype,
-          max_decode_steps=p.decoder_tpl.max_decode_steps,
-          eos_id=p.decoder_tpl.eos_id,
-          length_norm_alpha=p.decoder_tpl.length_norm_alpha)
-    elif template_has_type(p.decoder_tpl, BeamSearchHParams):
-      assert p.decoder_tpl.fprop_for_prefix
+      mdl_for_decode = decoder_utils.maybe_reshard_mdl_for_decode(
+          self.lm,
+          decode_mesh_transpose,
+          lm_var_pspecs,
+          transform_decode_state_fn,
+      )
+      with decoder_utils.maybe_decode_mesh_transpose(
+          mdl_for_decode, decode_mesh_transpose
+      ):
+        # Pad to full-sequence length.
+        mdl_for_decode.transform_decode_state(
+            decoder_utils.pad_state_fn(decode_data.state_padding_size)
+        )
+        result = flat_beam_search.flat_beam_search(
+            mdl_for_decode,
+            extend_step_fn,
+            decode_data.input_ids,
+            decode_data.input_paddings,
+            decode_data.seqlen,
+            beam_size=decoder_params.beam_size,
+            fprop_dtype=self.fprop_dtype,
+            max_decode_steps=decoder_params.max_decode_steps,
+            eos_id=decoder_params.eos_id,
+            length_norm_alpha=decoder_params.length_norm_alpha,
+        )
+    elif template_has_type(decoder_params, BeamSearchHParams):
+      assert isinstance(decoder_params, BeamSearchHParams)
+      assert decoder_params.fprop_for_prefix
 
       def fprop_fn(mdl, ids, paddings):
-        mdl.lm(
+        mdl(
             ids,
             paddings,
             segment_ids=decode_data.fprop_segment_ids,
             segment_pos=decode_data.fprop_segment_pos,
             start_time_step=decode_data.start_time_step,
             causal_attention_mask=decode_data.causal_attention_mask,
+            **decode_data.extra_input_kwargs
         )
-
-      result = beam_search.beam_search(self, extend_step_fn, fprop_fn,
-                                       transform_decode_state_fn,
-                                       decode_data.fprop_input_ids,
-                                       decode_data.fprop_input_paddings,
-                                       p.decoder_tpl)
-    elif template_has_type(p.decoder_tpl, SampleDecoderHParams):
+      assert isinstance(decoder_params, BeamSearchHParams)
+      result = beam_search.beam_search(
+          self.lm,
+          extend_step_fn,
+          fprop_fn,
+          transform_decode_state_fn,
+          decode_data.fprop_input_ids,
+          decode_data.fprop_input_paddings,
+          decoder_params,
+          decode_loop_mesh_axes_transpose=decode_mesh_transpose,
+          model_var_pspecs=lm_var_pspecs,
+      )
+    elif template_has_type(decoder_params, SampleDecoderHParams):
+      assert isinstance(decoder_params, SampleDecoderHParams)
       # Init cache states, batch size needs to multiply by num_samples.
       self.lm(
           decode_data.fprop_input_ids,
@@ -446,46 +531,70 @@ class LanguageModel(base_model.BaseModel):
           causal_attention_mask=decode_data.causal_attention_mask,
           **decode_data.extra_input_kwargs
       )
-
-      if not p.decoder_tpl.lazy_prefix_broadcast:
-        # Pad to full-sequence length.
-        self.lm.transform_decode_state(
-            decoder_utils.pad_state_fn(decode_data.state_padding_size))
-
-      if p.decoder_tpl.k > 0 and p.decoder_tpl.p:
-        raise ValueError(
-            'In decoder_tpl hparams, k and p should not be set at the'
-            ' same time. Currently k is: %s and p is: %s' %
-            (p.decoder_tpl.k, p.decoder_tpl.p))
-
-      # Fetch dynamic temperature from input_batch if the input_batch has this
-      # information.
-      if hasattr(input_batch, 'temperature'):
-        temperature = input_batch.temperature
-      else:
-        temperature = p.decoder_tpl.temperature
-
-      result = sample_decode.sample_decode(
-          self,
-          extend_step_fn,
+      mdl_for_decode = decoder_utils.maybe_reshard_mdl_for_decode(
+          self.lm,
+          decode_mesh_transpose,
+          lm_var_pspecs,
           transform_decode_state_fn,
-          lazy_broadcast_prefix_fn
-          if p.decoder_tpl.lazy_prefix_broadcast else None,
-          decode_data.input_ids,
-          decode_data.input_paddings,
-          decode_data.seqlen,
-          num_samples=p.decoder_tpl.num_samples,
-          k=p.decoder_tpl.k,
-          p=p.decoder_tpl.p,
-          fprop_for_prefix=p.decoder_tpl.fprop_for_prefix,
-          temperature=temperature,
-          max_prefix_len=max_prefix_len,
-          max_decode_steps=p.decoder_tpl.max_decode_steps,
-          prefix_lengths=decode_data.prefix_lengths,
-          eos_id=p.decoder_tpl.eos_id,
-          return_result_for_suffix_score=return_result_for_suffix_score,
       )
-    elif template_has_type(p.decoder_tpl, GreedyDecoderHParams):
+      with decoder_utils.maybe_decode_mesh_transpose(
+          mdl_for_decode, decode_mesh_transpose
+      ):
+        if not decoder_params.lazy_prefix_broadcast:
+          # Pad to full-sequence length.
+          mdl_for_decode.transform_decode_state(
+              decoder_utils.pad_state_fn(decode_data.state_padding_size)
+          )
+
+        # Fetch dynamic temperature from input_batch if the input_batch has this
+        # information.
+        if hasattr(input_batch, 'temperature'):
+          temperature = input_batch.temperature
+        else:
+          temperature = decoder_params.temperature
+
+        # Fetch dynamic per params from input_batch if the
+        # input_batch has this information.
+        per_example_max_decode_steps = getattr(
+            input_batch, 'per_example_max_decode_steps', None
+        )
+        per_example_top_p = getattr(input_batch, 'per_example_top_p', None)
+        per_example_top_k = getattr(input_batch, 'per_example_top_k', None)
+        eos_id = getattr(input_batch, 'eos_id', decoder_params.eos_id)
+
+        next_token_sampler_p = decoder_params.next_token_sampler_tpl.clone()
+        # TODO(b/260646361): Avoid this param propagation.
+        next_token_sampler_p.top_k = decoder_params.k
+        next_token_sampler_p.top_p = decoder_params.p
+        next_token_sampler = base_layer.instantiate(next_token_sampler_p)
+
+        result = sample_decode.sample_decode(
+            mdl_for_decode,
+            extend_step_fn,
+            transform_decode_state_fn,
+            lazy_broadcast_prefix_fn
+            if decoder_params.lazy_prefix_broadcast
+            else None,
+            next_token_sampler,
+            decode_data.input_ids,
+            decode_data.input_paddings,
+            decode_data.seqlen,
+            num_samples=decoder_params.num_samples,
+            fprop_for_prefix=decoder_params.fprop_for_prefix,
+            temperature=temperature,
+            per_example_top_p=per_example_top_p,
+            per_example_top_k=per_example_top_k,
+            max_prefix_len=max_prefix_len,
+            max_decode_steps=decoder_params.max_decode_steps,
+            per_example_max_decode_steps=per_example_max_decode_steps,
+            prefix_lengths=decode_data.prefix_lengths,
+            eos_id=eos_id,
+            return_result_for_suffix_score=return_result_for_suffix_score,
+            result_callback=result_callback,
+            cf_guidance_scale=decoder_params.cf_guidance_scale,
+        )
+    elif template_has_type(decoder_params, GreedyDecoderHParams):
+      assert isinstance(decoder_params, GreedyDecoderHParams)
       # Init cache states.
       self.lm(
           decode_data.fprop_input_ids,
@@ -496,24 +605,36 @@ class LanguageModel(base_model.BaseModel):
           causal_attention_mask=decode_data.causal_attention_mask,
           **decode_data.extra_input_kwargs,
       )
-      # Pad to full-sequence length.
-      self.lm.transform_decode_state(
-          decoder_utils.pad_state_fn(decode_data.state_padding_size))
-      result = sample_decode.greedy_decode(
-          self,
-          extend_step_fn,
-          decode_data.input_ids,
-          decode_data.input_paddings,
-          decode_data.seqlen,
-          fprop_for_prefix=p.decoder_tpl.fprop_for_prefix,
-          max_prefix_len=max_prefix_len,
-          max_decode_steps=p.decoder_tpl.max_decode_steps,
-          prefix_lengths=decode_data.prefix_lengths,
-          eos_id=p.decoder_tpl.eos_id)
+      mdl_for_decode = decoder_utils.maybe_reshard_mdl_for_decode(
+          self.lm,
+          decode_mesh_transpose,
+          lm_var_pspecs,
+          transform_decode_state_fn,
+      )
+      with decoder_utils.maybe_decode_mesh_transpose(
+          mdl_for_decode, decode_mesh_transpose
+      ):
+        # Pad to full-sequence length.
+        mdl_for_decode.transform_decode_state(
+            decoder_utils.pad_state_fn(decode_data.state_padding_size)
+        )
+        result = sample_decode.greedy_decode(
+            mdl_for_decode,
+            extend_step_fn,
+            decode_data.input_ids,
+            decode_data.input_paddings,
+            decode_data.seqlen,
+            fprop_for_prefix=decoder_params.fprop_for_prefix,
+            max_prefix_len=max_prefix_len,
+            max_decode_steps=decoder_params.max_decode_steps,
+            prefix_lengths=decode_data.prefix_lengths,
+            eos_id=decoder_params.eos_id,
+        )
     else:
       # Needs to define a decoding algorithm.
       raise NotImplementedError(
-          f'Decoding algorithm {type(p.decoder_tpl)} is not implemented.')
+          f'Decoding algorithm {type(decoder_params)} is not implemented.'
+      )
 
     result.update(input_batch)
 
@@ -542,13 +663,25 @@ class LanguageModel(base_model.BaseModel):
       - out_clu_metrics, a NestedMap containing str keys and clu_metrics.Metric
         objects. This is currently unused.
     """
+    # Optionally get all samples output in text format.
+    batch_size, num_samples, max_len = decode_out.output_ids.shape
+    if num_samples > 1:
+      sampled_ids = np.reshape(decode_out.output_ids, [-1, max_len])
+      sampled_lengths = np.reshape(decode_out.decode_lengths, [-1])
+      sampled_strs = input_obj.ids_to_strings(sampled_ids, sampled_lengths)
+      sampled_strs = np.reshape(sampled_strs, [batch_size, num_samples])
+    else:
+      sampled_strs = None
+
     # Get the first output within a batch.
     decode_out.output_ids = decode_out.output_ids[:, 0, :]
     decode_out.decode_lengths = decode_out.decode_lengths[:, 0]
     decode_out.original_lengths = decode_out.original_lengths[:, 0]
     decode_out.prefix_ids = decode_out.prefix_ids[:, 0, :]
-    decode_out.prefix_lengths = decode_out.prefix_lengths[:, 0]
     decode_out.logprobs = decode_out.logprobs[:, 0, :]
+    if decode_out.prefix_lengths.ndim == 2:
+      decode_out.prefix_lengths = decode_out.prefix_lengths[:, 0]
+
     decoded_strs = input_obj.ids_to_strings(decode_out.output_ids,
                                             decode_out.decode_lengths)
     original_strs = input_obj.ids_to_strings(decode_out.ids,
@@ -571,7 +704,7 @@ class LanguageModel(base_model.BaseModel):
           decoded_ids[None, :],
           np.array([decode_length - prefix_length], dtype=np.int32))[0]
 
-      ret.append((prefix_strs[idx], {
+      ret_dict = {
           'prefix': prefix_strs[idx],
           'decoded': decoded_str,
           'original': original_strs[idx],
@@ -581,7 +714,10 @@ class LanguageModel(base_model.BaseModel):
           'logprobs': decode_out.logprobs[idx],
           'prefix_length': prefix_length,
           'decode_length': decode_length,
-      }))
+      }
+      if sampled_strs is not None:
+        ret_dict['sampled'] = list(sampled_strs[idx])
+      ret.append((prefix_strs[idx], ret_dict))
 
     decoded_lengths = np.average(decode_out.decode_lengths).astype(np.float32)
     metrics = NestedMap(
@@ -591,38 +727,33 @@ class LanguageModel(base_model.BaseModel):
 
 
 class SequenceModel(base_model.BaseModel):
-  """Sequence Model base task."""
+  """Sequence Model base task.
 
-  class HParams(base_model.BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      model_tpl: Sequence model layer for this task.
-      return_predictions: Whether to return predictions during eval. Returning
-        predictions is more expensive, but may be useful for debugging.
-      decoder_tpl: Parameterization of the decoder.
-      label_smoothing_prob: If > 0.0, smooth out one-hot prob by spreading this
-        amount ofprob mass to all other tokens.
-    """
-    model_tpl: BaseHParams = sub_config_field(
-        transformer_models.TransformerEncoderDecoder.HParams)
-    return_predictions: bool = False
-    decoder_tpl: DecoderHParams = pax_fiddle.sub_field(
-        GreedyDecoderHParams)
-    label_smoothing_prob: float = 0.0
+  Attributes:
+    model_tpl: Sequence model layer for this task.
+    return_predictions: Whether to return predictions during eval. Returning
+      predictions is more expensive, but may be useful for debugging.
+    decoder_tpl: Parameterization of the decoder.
+    label_smoothing_prob: If > 0.0, smooth out one-hot prob by spreading this
+      amount ofprob mass to all other tokens.
+  """
+  model_tpl: LayerTpl = template_field(
+      transformer_models.TransformerEncoderDecoder
+  )
+  return_predictions: bool = False
+  decoder_tpl: DecoderHParams = base_layer.instance_field(GreedyDecoderHParams)
+  label_smoothing_prob: float = 0.0
 
   def setup(self) -> None:
     super().setup()
-    p = self.hparams
 
     # Construct the model.
-    model_p = p.model_tpl.clone()
+    model_p = self.model_tpl.clone()
     self.create_child('model', model_p)
 
   def compute_predictions(self, input_batch):
     """Computes predictions for `input_batch`."""
-    p = self.hparams
-    if p.model_tpl.packed_input:
+    if self.model_tpl.packed_input:
       packed_input_kwargs = {
           'input_segment_ids': input_batch.src.segment_ids,
           'input_segment_pos': input_batch.src.segment_pos,
@@ -634,13 +765,14 @@ class SequenceModel(base_model.BaseModel):
 
     labels = NestedMap(
         class_ids=input_batch.tgt.labels, class_weights=input_batch.tgt.weights)
-    if p.label_smoothing_prob > 0.0:
-      vocab_size = p.model_tpl.softmax_tpl.num_classes
+    if self.label_smoothing_prob > 0.0:
+      vocab_size = self.model_tpl.softmax_tpl.num_classes
       class_probabilities = jax.nn.one_hot(labels.class_ids, vocab_size)
-      fill_prob = p.label_smoothing_prob / (vocab_size - 1)
+      fill_prob = self.label_smoothing_prob / (vocab_size - 1)
       class_probabilities = (
-          (1.0 - p.label_smoothing_prob) * class_probabilities + fill_prob *
-          (1.0 - class_probabilities)).astype(self.fprop_dtype)
+          (1.0 - self.label_smoothing_prob) * class_probabilities
+          + fill_prob * (1.0 - class_probabilities)
+      ).astype(self.fprop_dtype)
       labels.class_probabilities = class_probabilities
 
     return self.model(
@@ -666,8 +798,9 @@ class SequenceModel(base_model.BaseModel):
         index.
     """
     # TODO(pax-dev): Add support for eval_sample_weights.
-    return compute_xent_loss_helper(predictions, input_batch.tgt,
-                                    self.hparams.return_predictions)
+    return compute_xent_loss_helper(
+        predictions, input_batch.tgt, self.return_predictions
+    )
 
   def decode(self, input_batch: NestedMap) -> DecodeOut:
     """Decodes input_batch.
@@ -683,13 +816,22 @@ class SequenceModel(base_model.BaseModel):
         int ids with the decoded output) as well as the decoded length.
       - metrics, A NestedMap of clu.metrics objects.
     """
-    p = self.hparams
-    if not template_has_type(p.decoder_tpl, DecoderHParams):
-      raise ValueError('p.decoder must be DecoderHParams type, but it is a '
-                       f'type of {type(p.decoder_tpl)}')
-    if p.decoder_tpl.seqlen <= 0:
-      raise ValueError('Must set p.decoder_tpl.seqlen > 0, current value = '
-                       f'{p.decoder_tpl.seqlen}')
+    if not template_has_type(self.decoder_tpl, DecoderHParams):
+      raise ValueError(
+          'p.decoder must be DecoderHParams type, but it is a '
+          f'type of {type(self.decoder_tpl)}'
+      )
+    return self.decode_with_params(input_batch, self.decoder_tpl)
+
+  def decode_with_params(
+      self, input_batch: NestedMap, decoder_params: DecoderHParams
+  ) -> DecodeOut:
+    """Same as decode but with specified DecoderHParams."""
+    if decoder_params.seqlen <= 0:
+      raise ValueError(
+          'Must set p.decoder_tpl.seqlen > 0, current value = '
+          f'{decoder_params.seqlen}'
+      )
     batch_size = input_batch.tgt.ids.shape[0]
 
     def extend_step_fn(mdl, ids, segment_pos):
@@ -701,10 +843,11 @@ class SequenceModel(base_model.BaseModel):
       mdl.model.transform_decode_state(transform_fn)
 
     # Flat beam search doesn't work yet.
-    if template_has_type(p.decoder_tpl, FlatBeamSearchHParams):
+    if template_has_type(decoder_params, FlatBeamSearchHParams):
       raise NotImplementedError('flat beam search not supported')
-    elif template_has_type(p.decoder_tpl, BeamSearchHParams):
-      assert not p.decoder_tpl.fprop_for_prefix
+    elif template_has_type(decoder_params, BeamSearchHParams):
+      assert isinstance(decoder_params, BeamSearchHParams)
+      assert not decoder_params.fprop_for_prefix
       start_time_step = 0
 
       # Prefix decoding is not fully supported.
@@ -720,29 +863,38 @@ class SequenceModel(base_model.BaseModel):
       fprop_input_ids = input_batch.tgt.ids[:, :1]
       fprop_input_paddings = jnp.ones((batch_size, 1),
                                       input_batch.tgt.paddings.dtype)
-      result = beam_search.beam_search(self, extend_step_fn, fprop_fn,
-                                       transform_decode_state_fn,
-                                       fprop_input_ids, fprop_input_paddings,
-                                       p.decoder_tpl)
-    elif template_has_type(p.decoder_tpl, SampleDecoderHParams):
+      result = beam_search.beam_search(
+          self,
+          extend_step_fn,
+          fprop_fn,
+          transform_decode_state_fn,
+          fprop_input_ids,
+          fprop_input_paddings,
+          decoder_params,
+      )
+    elif template_has_type(decoder_params, SampleDecoderHParams):
       raise NotImplementedError('sample decode not supported')
-    elif template_has_type(p.decoder_tpl, GreedyDecoderHParams):
+    elif template_has_type(decoder_params, GreedyDecoderHParams):
       self.model(
           inputs=input_batch.src.ids,
           input_paddings=input_batch.src.paddings,
-          targets=input_batch.tgt.ids,
-          target_paddings=input_batch.tgt.paddings)
+          targets=input_batch.tgt.ids[:, :1],
+          target_paddings=input_batch.tgt.paddings[:, :1])
+      self.model.transform_decode_state(
+          decoder_utils.pad_state_fn(self.decoder_tpl.seqlen))
       result = sample_decode.greedy_decode(
           self,
           extend_step_fn,
           input_batch.tgt.ids,
           input_batch.tgt.paddings,
-          p.decoder_tpl.seqlen,
-          eos_id=p.decoder_tpl.eos_id)
+          decoder_params.seqlen,
+          eos_id=decoder_params.eos_id,
+      )
     else:
       # Needs to define a decoding algorithm.
       raise NotImplementedError(
-          f'Decoding algorithm {type(p.decoder_tpl)} is not implemented.')
+          f'Decoding algorithm {type(decoder_params)} is not implemented.'
+      )
 
     result.update(input_batch)
     if hasattr(result, 'eval_sample_weights'):
@@ -770,6 +922,17 @@ class SequenceModel(base_model.BaseModel):
       - out_clu_metrics, a NestedMap containing str keys and clu_metrics.Metric
         objects. This is currently unused.
     """
+    # Optionally get all samples output in text format.
+    batch_size, num_samples, max_len = decode_out.output_ids.shape
+    if num_samples > 1:
+      sampled_ids = np.reshape(decode_out.output_ids, [-1, max_len])
+      sampled_lengths = np.reshape(decode_out.decode_lengths, [-1])
+      sampled_strs = input_obj.ids_to_strings(
+          sampled_ids, sampled_lengths, key='tgt')
+      sampled_strs = np.reshape(sampled_strs, [batch_size, num_samples])
+    else:
+      sampled_strs = None
+
     # Get the first output within a batch.
     decode_out.output_ids = decode_out.output_ids[:, 0, :]
     decode_out.decode_lengths = decode_out.decode_lengths[:, 0]
@@ -794,7 +957,8 @@ class SequenceModel(base_model.BaseModel):
       logging.info('SRC: %s\n', source_strs[idx])
       logging.info('TGT: %s\n', target_strs[idx])
       logging.info('OUT: %s\n', decoded_str)
-      ret.append((source_strs[idx], {
+
+      ret_dict = {
           'source': source_strs[idx],
           'decoded': decoded_str,
           'target': target_strs[idx],
@@ -804,7 +968,10 @@ class SequenceModel(base_model.BaseModel):
           # TODO(b/244434890): remove workaround with more robust integration
           'prefix': source_strs[idx],  # for seqio metrics
           'decoded_substr': decoded_str,  # for seqio metrics
-      }))
+      }
+      if sampled_strs is not None:
+        ret_dict['sampled'] = list(sampled_strs[idx])
+      ret.append((source_strs[idx], ret_dict))
     decode_lengths = np.average(decode_out.decode_lengths).astype(np.float32)
     metrics = NestedMap(
         decode_length=(decode_lengths, np.array(1.0, np.float32)))
@@ -813,27 +980,22 @@ class SequenceModel(base_model.BaseModel):
 
 
 class ClassificationModel(base_model.BaseModel):
-  """Classification task for images and video."""
+  """Classification task for images and video.
 
-  class HParams(base_model.BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      network_tpl: The classifier network_tpl, which is ResNet-50 by default.
-      softmax_tpl: The softmax_tpl layer used for the classification.
-      input_field: The input field which contains the image or video features to
-        pass to the classification network.
-    """
-    network_tpl: BaseHParams = sub_config_field(resnets.ResNet.HParams)
-    softmax_tpl: BaseHParams = sub_config_field(
-        embedding_softmax.FullSoftmax.HParams)
-    input_field: str = 'image'
+  Attributes:
+    network_tpl: The classifier network_tpl, which is ResNet-50 by default.
+    softmax_tpl: The softmax_tpl layer used for the classification.
+    input_field: The input field which contains the image or video features to
+      pass to the classification network.
+  """
+  network_tpl: LayerTpl = template_field(resnets.ResNet)
+  softmax_tpl: LayerTpl = template_field(embedding_softmax.FullSoftmax)
+  input_field: str = 'image'
 
   def setup(self) -> None:
     super().setup()
-    p = self.hparams
-    self.create_child('network', p.network_tpl)
-    self.create_child('softmax', p.softmax_tpl)
+    self.create_child('network', self.network_tpl)
+    self.create_child('softmax', self.softmax_tpl)
 
   def compute_predictions(self, input_batch: NestedMap) -> Predictions:
     """Computes predictions for `input_batch`.
@@ -845,8 +1007,7 @@ class ClassificationModel(base_model.BaseModel):
       - A NestedMap containing str keys and features, softmax output and the
         class weights as values.
     """
-    p = self.hparams
-    inputs = input_batch.Get(p.input_field)
+    inputs = input_batch.Get(self.input_field)
     features = self.network(inputs)
     batch_size = inputs.shape[0]
     example_weights = jnp.ones([batch_size])
@@ -922,8 +1083,7 @@ class ClassificationModel(base_model.BaseModel):
     Returns:
       - A NestedMap containing logits and logp scores.
     """
-    p = self.hparams
-    inputs = input_batch.Get(p.input_field)
+    inputs = input_batch.Get(self.input_field)
     features = self.network(inputs)
     logits = self.softmax.get_logits(inputs=features)
     logp = self.softmax.logits_to_logp(logits)
@@ -948,57 +1108,56 @@ class ClassificationModel(base_model.BaseModel):
 
 
 class BertModel(base_model.BaseModel):
-  """Bert Model base task."""
+  """Bert Model base task.
 
-  class HParams(base_model.BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      lm: BERT LM layer.
-      label_smoothing_prob: If > 0.0, smooth out one-hot prob by spreading this
-        amount of prob mass to all other tokens.
-      mask_token_id: Mask token id.
-    """
-    lm_tpl: BaseHParams = sub_config_field(
-        transformer_models.TransformerLm.HParams)
-    label_smoothing_prob: float = 0.0
-    mask_token_id: int = 0
+  Attributes:
+    lm: BERT LM layer.
+    label_smoothing_prob: If > 0.0, smooth out one-hot prob by spreading this
+      amount of prob mass to all other tokens.
+    mask_token_id: Mask token id.
+    force_mask_generation: if True, always use runtime generated
+      random mask for training, even if pre-generated masks exist in the
+      training examples.
+  """
+  lm_tpl: LayerTpl = template_field(transformer_models.TransformerLm)
+  label_smoothing_prob: float = 0.0
+  mask_token_id: int = 0
+  force_mask_generation: bool = False
 
   def setup(self) -> None:
     super().setup()
-    p = self.hparams
-    assert p.lm_tpl.model_type == LanguageModelType.BIDIRECTIONAL
-    assert p.lm_tpl.packed_input
+    assert self.lm_tpl.model_type == LanguageModelType.BIDIRECTIONAL
+    assert self.lm_tpl.packed_input
 
-    self.create_child('lm', p.lm_tpl)
+    self.create_child('lm', self.lm_tpl)
 
-    mlm_augment_p = augmentations.MaskedLmDataAugmenter.HParams()
-    mlm_augment_p.vocab_size = p.lm_tpl.vocab_size
-    mlm_augment_p.mask_token_id = p.mask_token_id
+    mlm_augment_p = pax_fiddle.Config(augmentations.MaskedLmDataAugmenter)
+    mlm_augment_p.vocab_size = self.lm_tpl.vocab_size
+    mlm_augment_p.mask_token_id = self.mask_token_id
     self.create_child('mlm_augmenter', mlm_augment_p)
 
   def compute_predictions(self, input_batch: NestedMap) -> Predictions:
     """Computes predictions for `input_batch`."""
-    p = self.hparams
-    assert p.lm_tpl.packed_input
+    assert self.lm_tpl.packed_input
     segment_ids = input_batch.segment_ids
     segment_pos = input_batch.segment_pos
     paddings = input_batch.paddings
     # Note that internal BertTransformer uses input_batch.ids instead.
     labels = input_batch.labels
-    if 'masked_ids' in input_batch:
+    if not self.force_mask_generation and 'masked_ids' in input_batch:
       # Input data already has masking done.
       augmented_labels = input_batch.masked_ids
       augmented_pos = input_batch.masked_pos
     else:
       augmented_labels, augmented_pos = self.mlm_augmenter(labels, paddings)
 
-    if p.label_smoothing_prob > 0.0:
-      class_probabilities = jax.nn.one_hot(labels, p.lm.vocab_size)
-      fill_prob = p.label_smoothing_prob / (p.lm.vocab_size - 1)
+    if self.label_smoothing_prob > 0.0:
+      class_probabilities = jax.nn.one_hot(labels, self.lm.vocab_size)
+      fill_prob = self.label_smoothing_prob / (self.lm.vocab_size - 1)
       class_probabilities = (
-          (1.0 - p.label_smoothing_prob) * class_probabilities + fill_prob *
-          (1.0 - class_probabilities)).astype(self.fprop_dtype)
+          (1.0 - self.label_smoothing_prob) * class_probabilities
+          + fill_prob * (1.0 - class_probabilities)
+      ).astype(self.fprop_dtype)
 
       # Only compute loss on masked pos.
       labels = NestedMap(
@@ -1060,27 +1219,24 @@ class BertModel(base_model.BaseModel):
 
 
 class ClassificationMLPModel(base_model.BaseModel):
-  """Language Model task with a simple MLP model."""
+  """Language Model task with a simple MLP model.
 
-  class HParams(base_model.BaseModel.HParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      mlp_tpl: MLP model parameters.
-      softmax_tpl: Input softmax_tpl embedding lookup layer.
-    """
-    mlp_tpl: BaseHParams = sub_config_field(linears.MLPBlock.HParams)
-    softmax_tpl: BaseHParams = sub_config_field(
-        embedding_softmax.SharedEmbeddingSoftmax.HParams)
+  Attributes:
+    mlp_tpl: MLP model parameters.
+    softmax_tpl: Input softmax_tpl embedding lookup layer.
+  """
+  mlp_tpl: LayerTpl = template_field(linears.MLPBlock)
+  softmax_tpl: LayerTpl = template_field(
+      embedding_softmax.SharedEmbeddingSoftmax
+  )
 
   def setup(self) -> None:
     super().setup()
-    p = self.hparams
     # Note: We add a `_0` suffix here because this child was previously created
     # using create_children; and we want to ensure that its name stays the
     # same (for checkpoints, etc).
-    self.create_child('mlp_layers_0', p.mlp_tpl)
-    self.create_child('softmax', p.softmax_tpl)
+    self.create_child('mlp_layers_0', self.mlp_tpl)
+    self.create_child('softmax', self.softmax_tpl)
 
   def compute_predictions(self, input_batch: NestedMap) -> Predictions:
 

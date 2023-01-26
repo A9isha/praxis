@@ -26,6 +26,7 @@ from jax.ad_checkpoint import checkpoint_name
 import numpy as np
 from praxis import base_layer
 from praxis import gshard_utils
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
 from praxis.layers import activations as activations_lib
@@ -42,14 +43,13 @@ NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
 WeightHParams = base_layer.WeightHParams
 sub_config_field = base_layer.sub_config_field
+template_field = base_layer.template_field
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 
 JTensor = pytypes.JTensor
 NestedJTensor = pytypes.NestedJTensor
 
 SplitDimsMapping = pytypes.SplitDimsMapping
-BaseHParams = base_layer.BaseLayer.HParams
-BaseWtShardingHParams = base_layer.BaseLayer.WeightShardingHParams
-BaseActShardingHParams = base_layer.BaseLayer.ActivationShardingHParams
 AutodiffCheckpointType = checkpoint_policy.AutodiffCheckpointType
 
 
@@ -144,7 +144,7 @@ def compute_attention_masks_for_extend_step(
 
   Returns:
     attention_mask: Attention mask JTensor ready to add to logits for self
-      attention of shape [1|B, 1, 1, T].
+      attention of shape [1|B, 1, T].
     cross_attention_mask: Attention mask JTensor ready to add to logits for
       cross attention of shape [1|B, 1, 1, S]. This will be None if
       cross_paddings are None.
@@ -225,67 +225,63 @@ def _get_sentence_embeddings(inputs: JTensor, segment_ids: JTensor) -> JTensor:
 
 
 class TransformerFeedForward(base_layer.BaseLayer):
-  """Transformer feedforward layer with residual connection and dropout."""
+  """Transformer feedforward layer with residual connection and dropout.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
+  Attributes:
+    input_dims: Depth of the input.
+    output_dims: Depth of the output. If unset or output_dims == input_dims,
+      there is no residual projection layer. Otherwise, add a residual
+      projection layer followed by batch normalization.
+    hidden_dims: Hidden dimension of FFN.
+    has_bias: Adds bias weights to Feedforward or not.
+    apply_padding_first: Apply padding to inputs before everything else or not.
+      For example, it is better to apply padding before batch norm.
+    activation_tpl: Activation function to use.
+    use_gated_activation: Boolean indicating whether to use a gated activation
+      function for the first feedforward layer or not.
+    fflayer_tpl: Parameterization of the feedforward layer.
+    ln_tpl: Parameterization of the layer normalization layer. Other options
+      include RmsNorm as well.
+    residual_dropout_prob: Residual dropout.
+    relu_dropout_tpl: Parameterization of the relu dropout layer. keep_prop will
+      be reset to (1.0 - relu_dropout_prob).
+    relu_dropout_prob: FFN dropout.
+    residual_dropout_tpl: Parameterization of the residual dropout params
+      template. keep_prop will be reset to (1.0 - residual_dropout_prob).
+    add_skip_connection: Whether to add residual connection.
+    residual_weight: Weight of the residual connection. Output = fn(x) *
+      residual_weight + x.
+    residual_droppath_prob: Probability at which we drop the entire residual
+      path.
+    norm_policy: Policy for applying normaliztion wrt. transformations. Options
+      are: (1) "pre", applied before transformation. (2) "primer_hybrid",
+      applied before and after transformation. (3) "post", applied after
+      transformation.
+    internal_gshard_variance_scaling_fan_in_init: Feedforward weight init
+      follows uniform distribution withbound = 1.0 / sqrt(3 / dim_0).
+  """
+  input_dims: int = 0
+  output_dims: int = 0
+  hidden_dims: int = 0
+  has_bias: bool = True
+  apply_padding_first: bool = False
+  activation_tpl: pax_fiddle.Config[
+      activations_lib.BaseActivation
+  ] = template_field(activations_lib.ReLU)
+  use_gated_activation: bool = False
+  fflayer_tpl: LayerTpl = template_field(linears.FeedForward)
+  ln_tpl: LayerTpl = template_field(normalizations.LayerNorm)
+  residual_dropout_prob: float = 0.0
+  relu_dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
+  relu_dropout_prob: float = 0.0
+  residual_dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
+  add_skip_connection: bool = True
+  residual_weight: float = 1.0
+  residual_droppath_prob: float = 0.0
+  norm_policy: str = 'pre'
+  internal_gshard_variance_scaling_fan_in_init: bool = False
 
-    Attributes:
-      input_dims: Depth of the input.
-      output_dims: Depth of the output. If unset or output_dims == input_dims,
-        there is no residual projection layer. Otherwise, add a residual
-        projection layer followed by batch normalization.
-      hidden_dims: Hidden dimension of FFN.
-      has_bias: Adds bias weights to Feedforward or not.
-      apply_padding_first: Apply padding to inputs before everything else or
-        not. For example, it is better to apply padding before batch norm.
-      activation_tpl: Activation function to use.
-      use_gated_activation: Boolean indicating whether to use a gated activation
-        function for the second feedforward layer or not.
-      fflayer_tpl: Parameterization of the feedforward layer.
-      ln_tpl: Parameterization of the layer normalization layer. Other options
-        include RmsNorm as well.
-      residual_dropout_prob: Residual dropout.
-      relu_dropout_tpl: Parameterization of the relu dropout layer. keep_prop
-        will be reset to (1.0 - relu_dropout_prob).
-      relu_dropout_prob: FFN dropout.
-      residual_dropout_tpl: Parameterization of the residual dropout params
-        template. keep_prop will be reset to (1.0 - residual_dropout_prob).
-      add_skip_connection: Whether to add residual connection.
-      residual_weight: Weight of the residual connection. Output = fn(x) *
-        residual_weight + x.
-      residual_droppath_prob: Probability at which we drop the entire residual
-        path.
-      norm_policy: Policy for applying normaliztion wrt. transformations.
-        Options are: (1) "pre", applied before transformation. (2)
-        "primer_hybrid", applied before and after transformation. (3) "post",
-        applied after transformation.
-      internal_gshard_variance_scaling_fan_in_init: Feedforward weight init
-        follows uniform distribution withbound = 1.0 / sqrt(3 / dim_0).
-    """
-    input_dims: int = 0
-    output_dims: int = 0
-    hidden_dims: int = 0
-    has_bias: bool = True
-    apply_padding_first: bool = False
-    activation_tpl: activations_lib.BaseActivation.HParams = sub_config_field(
-        activations_lib.ReLU.HParams)
-    use_gated_activation: bool = False
-    fflayer_tpl: BaseHParams = sub_config_field(linears.FeedForward.HParams)
-    ln_tpl: BaseHParams = sub_config_field(normalizations.LayerNorm.HParams)
-    residual_dropout_prob: float = 0.0
-    relu_dropout_tpl: BaseHParams = sub_config_field(
-        stochastics.Dropout.HParams)
-    relu_dropout_prob: float = 0.0
-    residual_dropout_tpl: BaseHParams = sub_config_field(
-        stochastics.Dropout.HParams)
-    add_skip_connection: bool = True
-    residual_weight: float = 1.0
-    residual_droppath_prob: float = 0.0
-    norm_policy: str = 'pre'
-    internal_gshard_variance_scaling_fan_in_init: bool = False
-
-  class WeightShardingHParams(BaseWtShardingHParams):
+  class WeightSharding(base_layer.BaseLayer.WeightSharding):
     """Represents how layer's learned parameters are partitioned across a mesh.
 
     Attributes:
@@ -295,7 +291,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
     ffn0: SplitDimsMapping = None
     ffn1: SplitDimsMapping = None
 
-  class ActivationShardingHParams(BaseActShardingHParams):
+  class ActivationSharding(base_layer.BaseLayer.ActivationSharding):
     """Represents how intermediate values should be partitioned across a mesh.
 
     Attributes:
@@ -306,114 +302,114 @@ class TransformerFeedForward(base_layer.BaseLayer):
     ffn1: SplitDimsMapping = None
 
   def setup(self) -> None:
-    p = self.hparams
 
-    output_dims = p.output_dims
+    output_dims = self.output_dims
     if output_dims == 0:
       # Make it compatible with previous implementation
-      output_dims = p.input_dims
+      output_dims = self.input_dims
     else:
-      assert output_dims == p.input_dims, (p.input_dims, output_dims)
+      assert output_dims == self.input_dims, (self.input_dims, output_dims)
 
-    wp = p.weight_split_dims_mapping
-    ap = p.activation_split_dims_mapping
+    wp = self.weight_split_dims_mapping
+    ap = self.activation_split_dims_mapping
     # Create Layer Norm
-    if p.norm_policy == 'primer_hybrid':
-      ln_p = p.ln_tpl.clone()
-      ln_p.dim = p.input_dims
+    if self.norm_policy == 'primer_hybrid':
+      ln_p = self.ln_tpl.clone()
+      ln_p.dim = self.input_dims
       self.create_child('pre_layer_norm', ln_p)
       self.create_child('post_layer_norm', ln_p)
-    elif p.norm_policy == 'pre' or p.norm_policy == 'post':
-      ln_p = p.ln_tpl.clone()
+    elif self.norm_policy == 'pre' or self.norm_policy == 'post':
+      ln_p = self.ln_tpl.clone()
       ln_p.name = 'fflayer_ln'
-      ln_p.dim = p.input_dims
+      ln_p.dim = self.input_dims
       self.create_child('layer_norm', ln_p)
     else:
-      raise ValueError('Unrecognized norm_policy: %s' % p.norm_policy)
+      raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
-    self._is_ffn1_gated = p.use_gated_activation
+    self._is_ffn1_gated = self.use_gated_activation
     if self._is_ffn1_gated:
-      activation = activations_lib.Identity.HParams()
-      gate_activation = p.activation_tpl.clone()
+      activation = pax_fiddle.Config(activations_lib.Identity)
+      gate_activation = self.activation_tpl.clone()
     else:
-      activation = p.activation_tpl.clone()
+      activation = self.activation_tpl.clone()
       gate_activation = None
 
     # Create the first Feedforward layer mapping to hidden dims
-    ffn1_p = p.fflayer_tpl.clone()
+    ffn1_p = self.fflayer_tpl.clone()
     ffn1_p.name = 'ffn_layer1'
-    ffn1_p.input_dims = p.input_dims
-    ffn1_p.has_bias = p.has_bias
+    ffn1_p.input_dims = self.input_dims
+    ffn1_p.has_bias = self.has_bias
     ffn1_p.activation_tpl = activation
-    ffn1_p.output_dims = p.hidden_dims
+    ffn1_p.output_dims = self.hidden_dims
     ffn1_p.weight_split_dims_mapping.wt = wp.ffn0
     ffn1_p.activation_split_dims_mapping.out = ap.ffn0
-    if p.internal_gshard_variance_scaling_fan_in_init:
-      scale = (1. / p.input_dims)**0.5 * (3.0**0.5)
+    if self.internal_gshard_variance_scaling_fan_in_init:
+      scale = (1.0 / self.input_dims) ** 0.5 * (3.0**0.5)
       ffn1_p.linear_tpl.params_init = WeightInit.Uniform(scale)
     self.create_child('ffn_layer1', ffn1_p)
 
     if self._is_ffn1_gated:
       # This is a gated ffw network, corresponding to gshard_builder's wi0
-      gate_p = p.fflayer_tpl.clone()
+      gate_p = self.fflayer_tpl.clone()
       gate_p.name = 'ffn_layer1_gate'
-      gate_p.input_dims = p.input_dims
-      gate_p.has_bias = p.has_bias
+      gate_p.input_dims = self.input_dims
+      gate_p.has_bias = self.has_bias
       gate_p.activation_tpl = gate_activation
-      gate_p.output_dims = p.hidden_dims
+      gate_p.output_dims = self.hidden_dims
       gate_p.weight_split_dims_mapping.wt = wp.ffn0
       gate_p.activation_split_dims_mapping.out = ap.ffn0
-      if p.internal_gshard_variance_scaling_fan_in_init:
-        scale = (1. / p.input_dims)**0.5 * (3.0**0.5)
+      if self.internal_gshard_variance_scaling_fan_in_init:
+        scale = (1.0 / self.input_dims) ** 0.5 * (3.0**0.5)
         gate_p.linear_tpl.params_init = WeightInit.Uniform(scale)
       self.create_child('ffn_layer1_gate', gate_p)
 
     # Create RELU dropout layer
-    relu_dropout_p = p.relu_dropout_tpl.clone()
-    relu_dropout_p.keep_prob = 1.0 - p.relu_dropout_prob
+    relu_dropout_p = self.relu_dropout_tpl.clone()
+    relu_dropout_p.keep_prob = 1.0 - self.relu_dropout_prob
     self.create_child('relu_dropout', relu_dropout_p)
 
     # Create the second Feedforward layer mapping to input dims
-    ffn2_p = p.fflayer_tpl.clone()
+    ffn2_p = self.fflayer_tpl.clone()
     ffn2_p.name = 'ffn_layer2'
-    ffn2_p.input_dims = p.hidden_dims
-    ffn2_p.has_bias = p.has_bias
-    ffn2_p.activation_tpl = activations_lib.Identity.HParams()
+    ffn2_p.input_dims = self.hidden_dims
+    ffn2_p.has_bias = self.has_bias
+    ffn2_p.activation_tpl = pax_fiddle.Config(activations_lib.Identity)
     ffn2_p.output_dims = output_dims
     ffn2_p.weight_split_dims_mapping.wt = wp.ffn1
     ffn2_p.activation_split_dims_mapping.out = ap.ffn1
-    if p.internal_gshard_variance_scaling_fan_in_init:
-      scale = (1. / p.hidden_dims)**0.5 * (3.0**0.5)
+    if self.internal_gshard_variance_scaling_fan_in_init:
+      scale = (1.0 / self.hidden_dims) ** 0.5 * (3.0**0.5)
       ffn2_p.linear_tpl.params_init = WeightInit.Uniform(scale)
     self.create_child('ffn_layer2', ffn2_p)
 
     # Create residual dropout layer
-    residual_dropout_p = p.residual_dropout_tpl.clone()
-    residual_dropout_p.keep_prob = 1.0 - p.residual_dropout_prob
+    residual_dropout_p = self.residual_dropout_tpl.clone()
+    residual_dropout_p.keep_prob = 1.0 - self.residual_dropout_prob
     self.create_child('residual_dropout', residual_dropout_p)
 
-    if p.residual_droppath_prob > 0:
-      assert p.add_skip_connection
-      droppath_p = stochastics.StochasticResidual.HParams(
+    if self.residual_droppath_prob > 0:
+      assert self.add_skip_connection
+      droppath_p = pax_fiddle.Config(
+          stochastics.StochasticResidual,
           name='residual_droppath',
-          survival_prob=1.0 - p.residual_droppath_prob)
+          survival_prob=1.0 - self.residual_droppath_prob,
+      )
       self.create_child('residual_droppath', droppath_p)
 
   def __call__(self,
                inputs: JTensor,
                paddings: Optional[JTensor] = None,
                segment_ids: Optional[JTensor] = None) -> JTensor:
-    p = self.hparams
     # Expand paddings to last dim if not None to have shape [batch, time, 1]
     if paddings is not None:
       paddings = jnp.expand_dims(paddings, axis=-1)
 
-    if p.apply_padding_first and paddings is not None:
+    if self.apply_padding_first and paddings is not None:
       inputs *= (1.0 - paddings)
 
-    if p.norm_policy == 'primer_hybrid':
+    if self.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
-    elif p.norm_policy == 'pre':
+    elif self.norm_policy == 'pre':
       inputs_normalized = self.layer_norm(inputs)
     else:
       inputs_normalized = inputs
@@ -429,7 +425,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
       projected_inputs = checkpoint_name(projected_inputs, 'ffn1')
 
     # Apply paddings if not None
-    if not p.apply_padding_first and paddings is not None:
+    if not self.apply_padding_first and paddings is not None:
       projected_inputs *= (1.0 - paddings)
 
     # Apply RELU dropout
@@ -440,24 +436,24 @@ class TransformerFeedForward(base_layer.BaseLayer):
     projected_inputs = checkpoint_name(projected_inputs, 'ffn2')
 
     # Apply paddings if not None
-    if not p.apply_padding_first and paddings is not None:
+    if not self.apply_padding_first and paddings is not None:
       projected_inputs *= (1.0 - paddings)
 
     # Apply Primer normalization before dropout.
-    if p.norm_policy == 'primer_hybrid':
+    if self.norm_policy == 'primer_hybrid':
       projected_inputs = self.post_layer_norm(projected_inputs)
-    elif p.norm_policy == 'post':
+    elif self.norm_policy == 'post':
       projected_inputs = self.layer_norm(projected_inputs)
 
     # Apply residual dropout
     projected_inputs = self.residual_dropout(projected_inputs)
 
     # Apply skip connection
-    if p.add_skip_connection:
-      if p.residual_droppath_prob:
+    if self.add_skip_connection:
+      if self.residual_droppath_prob:
         projected_inputs = self.residual_droppath(inputs, projected_inputs)
       else:
-        projected_inputs = inputs + projected_inputs * p.residual_weight
+        projected_inputs = inputs + projected_inputs * self.residual_weight
 
     return projected_inputs
 
@@ -472,101 +468,96 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
   moe_output = moe(ln_inputs)
   drop_output = dropout(moe_output)
   output = inputs + drop_output
+
+  Attributes:
+    input_dims: Dimension of the layer input.
+    hidden_dims: Dimension of the hidden layer.
+    apply_padding_first: Apply padding to inputs before everything else or
+      not. For example, it is better to apply padding before batch norm.
+    ln_tpl: Parameterization of the layer normalization layer.
+    activation_tpl: Activation function to use.
+    relu_dropout_tpl: Parameterization of the relu dropout layer. keep_prop
+      will be reset to (1.0 - relu_dropout_prob).
+    relu_dropout_prob: Probability at which we apply dropout to the hidden
+      layer of feedforward network..
+    residual_dropout_tpl: Parameterization of the residual dropout params
+      template. keep_prop will be reset to (1.0 - residual_dropout_prob).
+    residual_dropout_prob: Probability at which we apply dropout to the
+      residual layers, such that, residual(x, y) = (x + dropout(y)).
+    add_skip_connection: If True, add skip_connection from input to output.
+    residual_weight: Weight applied on residual connection. Final output is
+      residual_weight * residual_fn(x) + x. Only in effect when
+      add_skip_connection is True.
+    norm_policy: Policy for applying normaliztion wrt. transformations.
+      Options are: (1) "pre", applied before transformation. (2)
+      "primer_hybrid", applied before and after transformation. (3) "post",
+      applied after transformation.
+    residual_droppath_prob: Probability at which we drop the entire residual
+      path.
+    gating_func: Gating function type--can be one of the following options:
+      'top2', based on the GShard paper: https://arxiv.org/abs/2006.16668,
+      'expert_choice', based on https://arxiv.org/abs/2202.09368,
+      'dense_top2': experimental gating function for decodiing. Similar to
+      'top2' gating, but no capacity constrainst for each expert.
+    num_experts: Total number of experts in this layer.
+    num_groups: Total number of groups for dispatching. num_groups typically
+      should be the same as num devices.
+    min_group_size: If not None, num_groups will be adjusted so that there
+      will be at least min_group_size tokens in each group.
+    expert_capacity_dim: Internal. Exact expert capacity. Setting non-zero
+      unadjusted_expert_capacity_factor is a preferred way.
+    unadjusted_expert_capacity_factor: Expert capacity factor. This is the
+      ratio between global batch size and total capacity across all experts
+      and all routing groups. If the global batch size is G*S (num_groups*
+      group_size) or B*L(batch*length) and the total expert capacity across
+      all routing groups is E*G*C (num_experts*num_groups*expert_capacity),
+      then unadjusted_expert_capacity_factor == (E*G*C)/(G*S)
+      unadjusted_expert_capacity_factor is set to 2 by default for top-2
+      routing.
+    expert_weight_shards: Shard each expert params into this many number of
+      shards to reduce the size of individual weight params.
+    second_expert_policy: How to pick second expert: all, sampling or random.
+    internal_gshard_variance_scaling_fan_in_init: Internal. Do not use. To
+      study MoE layer init.
+    moe_load_balance_loss_weight: Weight for the load balancing loss of the
+      MoE layer.
+    gating_logit_cap:  Cap the absolute values of MoE gating logits by tanh.
+      Enabled when a positive value is specified.
+    moe_gating_embedding_level: Specifies the type of MOE gating embedding
+    used.
+    See Section 3.1 https://arxiv.org/pdf/2110.03742.pdf.
+    Options are:
+      (1) "token" -> The gating function uses tokens to route.
+      (2) "sentence" -> The gating function uses the sentence embeddings,
+          calculated by taking the average token representation, to route.
   """
-
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      input_dims: Dimension of the layer input.
-      hidden_dims: Dimension of the hidden layer.
-      apply_padding_first: Apply padding to inputs before everything else or
-        not. For example, it is better to apply padding before batch norm.
-      ln_tpl: Parameterization of the layer normalization layer.
-      activation_tpl: Activation function to use.
-      relu_dropout_tpl: Parameterization of the relu dropout layer. keep_prop
-        will be reset to (1.0 - relu_dropout_prob).
-      relu_dropout_prob: Probability at which we apply dropout to the hidden
-        layer of feedforward network..
-      residual_dropout_tpl: Parameterization of the residual dropout params
-        template. keep_prop will be reset to (1.0 - residual_dropout_prob).
-      residual_dropout_prob: Probability at which we apply dropout to the
-        residual layers, such that, residual(x, y) = (x + dropout(y)).
-      add_skip_connection: If True, add skip_connection from input to output.
-      residual_weight: Weight applied on residual connection. Final output is
-        residual_weight * residual_fn(x) + x. Only in effect when
-        add_skip_connection is True.
-      norm_policy: Policy for applying normaliztion wrt. transformations.
-        Options are: (1) "pre", applied before transformation. (2)
-        "primer_hybrid", applied before and after transformation. (3) "post",
-        applied after transformation.
-      residual_droppath_prob: Probability at which we drop the entire residual
-        path.
-      gating_func: Gating function type--can be one of the following options:
-        'top2', based on the GShard paper: https://arxiv.org/abs/2006.16668,
-        'expert_choice', based on https://arxiv.org/abs/2202.09368,
-        'dense_top2': experimental gating function for decodiing. Similar to
-        'top2' gating, but no capacity constrainst for each expert.
-      num_experts: Total number of experts in this layer.
-      num_groups: Total number of groups for dispatching. num_groups typically
-        should be the same as num devices.
-      min_group_size: If not None, num_groups will be adjusted so that there
-        will be at least min_group_size tokens in each group.
-      expert_capacity_dim: Internal. Exact expert capacity. Setting non-zero
-        unadjusted_expert_capacity_factor is a preferred way.
-      unadjusted_expert_capacity_factor: Expert capacity factor. This is the
-        ratio between global batch size and total capacity across all experts
-        and all routing groups. If the global batch size is G*S (num_groups*
-        group_size) or B*L(batch*length) and the total expert capacity across
-        all routing groups is E*G*C (num_experts*num_groups*expert_capacity),
-        then unadjusted_expert_capacity_factor == (E*G*C)/(G*S)
-        unadjusted_expert_capacity_factor is set to 2 by default for top-2
-        routing.
-      expert_weight_shards: Shard each expert params into this many number of
-        shards to reduce the size of individual weight params.
-      second_expert_policy: How to pick second expert: all, sampling or random.
-      internal_gshard_variance_scaling_fan_in_init: Internal. Do not use. To
-        study MoE layer init.
-      moe_load_balance_loss_weight: Weight for the load balancing loss of the
-        MoE layer.
-      gating_logit_cap:  Cap the absolute values of MoE gating logits by tanh.
-        Enabled when a positive value is specified.
-      moe_gating_embedding_level: Specifies the type of MOE gating embedding
-      used.
-      See Section 3.1 https://arxiv.org/pdf/2110.03742.pdf.
-      Options are:
-        (1) "token" -> The gating function uses tokens to route.
-        (2) "sentence" -> The gating function uses the sentence embeddings,
-            calculated by taking the average token representation, to route.
-    """
-    input_dims: int = 0
-    hidden_dims: int = 0
-    apply_padding_first: bool = False
-    ln_tpl: BaseHParams = sub_config_field(normalizations.LayerNorm.HParams)
-    activation_tpl: activations_lib.BaseActivation.HParams = sub_config_field(
-        activations_lib.ReLU.HParams)
-    relu_dropout_tpl: BaseHParams = sub_config_field(
-        stochastics.Dropout.HParams)
-    relu_dropout_prob: float = 0.0
-    residual_dropout_tpl: BaseHParams = sub_config_field(
-        stochastics.Dropout.HParams)
-    residual_dropout_prob: float = 0.0
-    add_skip_connection: bool = True
-    residual_weight: float = 1.0
-    norm_policy: str = 'pre'
-    residual_droppath_prob: float = 0.0
-    gating_func: str = 'top2'
-    num_experts: int = 0
-    num_groups: int = 0
-    min_group_size: Optional[int] = None
-    expert_capacity_dim: int = 0
-    unadjusted_expert_capacity_factor: float = 2.0
-    expert_weight_shards: int = 1
-    second_expert_policy: str = 'all'
-    internal_gshard_variance_scaling_fan_in_init: bool = True
-    moe_load_balance_loss_weight: float = 1.0
-    gating_logit_cap: float = 0.0
-    moe_gating_embedding_level: str = 'token'
+  input_dims: int = 0
+  hidden_dims: int = 0
+  apply_padding_first: bool = False
+  ln_tpl: LayerTpl = template_field(normalizations.LayerNorm)
+  activation_tpl: pax_fiddle.Config[
+      activations_lib.BaseActivation
+  ] = template_field(activations_lib.ReLU)
+  relu_dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
+  relu_dropout_prob: float = 0.0
+  residual_dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
+  residual_dropout_prob: float = 0.0
+  add_skip_connection: bool = True
+  residual_weight: float = 1.0
+  norm_policy: str = 'pre'
+  residual_droppath_prob: float = 0.0
+  gating_func: str = 'top2'
+  num_experts: int = 0
+  num_groups: int = 0
+  min_group_size: Optional[int] = None
+  expert_capacity_dim: int = 0
+  unadjusted_expert_capacity_factor: float = 2.0
+  expert_weight_shards: int = 1
+  second_expert_policy: str = 'all'
+  internal_gshard_variance_scaling_fan_in_init: bool = True
+  moe_load_balance_loss_weight: float = 1.0
+  gating_logit_cap: float = 0.0
+  moe_gating_embedding_level: str = 'token'
 
   # SPMD partition related params.
   # M - model_dim, for both inputs and outputs
@@ -576,7 +567,7 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
   # H - hidden dim
   # S - sequence dim
 
-  class WeightShardingHParams(BaseWtShardingHParams):
+  class WeightSharding(base_layer.BaseLayer.WeightSharding):
     """Represents how layer's learned parameters are partitioned across a mesh.
 
     Attributes:
@@ -591,7 +582,7 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     emh: SplitDimsMapping = None
     ehm: SplitDimsMapping = None
 
-  class ActivationShardingHParams(BaseActShardingHParams):
+  class ActivationSharding(base_layer.BaseLayer.ActivationSharding):
     """Represents how intermediate values should be partitioned across a mesh.
 
     Attributes:
@@ -614,63 +605,66 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     gecm: SplitDimsMapping = None
 
   def setup(self) -> None:
-    p = self.hparams
-    assert p.name
-    assert p.input_dims
-    assert p.hidden_dims
+    assert self.name
+    assert self.input_dims
+    assert self.hidden_dims
 
-    assert (p.unadjusted_expert_capacity_factor or p.expert_capacity_dim)
-    assert p.num_experts > 0
-    assert p.num_groups > 0
-    assert p.expert_weight_shards == 1, (
-        f'[Deprecated] Should be removed {p.expert_weight_shards} != 1')
+    assert self.unadjusted_expert_capacity_factor or self.expert_capacity_dim
+    assert self.num_experts > 0
+    assert self.num_groups > 0
+    assert (
+        self.expert_weight_shards == 1
+    ), f'[Deprecated] Should be removed {self.expert_weight_shards} != 1'
 
-    if p.norm_policy == 'primer_hybrid':
-      params = p.ln_tpl.clone()
-      params.dim = p.input_dims
+    if self.norm_policy == 'primer_hybrid':
+      params = self.ln_tpl.clone()
+      params.dim = self.input_dims
       self.create_child('pre_layer_norm', params)
       self.create_child('post_layer_norm', params)
-    elif p.norm_policy == 'pre' or p.norm_policy == 'post':
-      params = p.ln_tpl.clone()
+    elif self.norm_policy == 'pre' or self.norm_policy == 'post':
+      params = self.ln_tpl.clone()
       params.name = 'layer_norm'
-      params.dim = p.input_dims
+      params.dim = self.input_dims
       self.create_child('layer_norm', params)
     else:
-      raise ValueError('Unrecognized norm_policy: %s' % p.norm_policy)
+      raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
-    dropout_tpl = p.residual_dropout_tpl.clone()
-    dropout_tpl.keep_prob = (1.0 - p.residual_dropout_prob)
+    dropout_tpl = self.residual_dropout_tpl.clone()
+    dropout_tpl.keep_prob = 1.0 - self.residual_dropout_prob
     self.create_child('residual_dropout', dropout_tpl)
 
-    dropout_tpl = p.relu_dropout_tpl.clone()
-    dropout_tpl.keep_prob = (1.0 - p.relu_dropout_prob)
+    dropout_tpl = self.relu_dropout_tpl.clone()
+    dropout_tpl.keep_prob = 1.0 - self.relu_dropout_prob
     self.create_child('relu_dropout', dropout_tpl)
 
-    if p.residual_droppath_prob > 0:
-      assert p.add_skip_connection
-      droppath_p = stochastics.StochasticResidual.HParams(
+    if self.residual_droppath_prob > 0:
+      assert self.add_skip_connection
+      droppath_p = pax_fiddle.Config(
+          stochastics.StochasticResidual,
           name='residual_droppath',
-          survival_prob=1.0 - p.residual_droppath_prob)
+          survival_prob=1.0 - self.residual_droppath_prob,
+      )
       self.create_child('residual_droppath', droppath_p)
 
-    self.create_child('activation', p.activation_tpl.clone())
+    self.create_child('activation', self.activation_tpl.clone())
 
     # Assume output_dims == input_dims
-    output_dims = p.input_dims
+    output_dims = self.input_dims
 
     # First create the gating network.
-    wp = p.weight_split_dims_mapping
+    wp = self.weight_split_dims_mapping
     gate_init = None  # default xavier init
-    if p.internal_gshard_variance_scaling_fan_in_init:
+    if self.internal_gshard_variance_scaling_fan_in_init:
       # TODO(lepikhin): this init is related with Adafactor settings, study
-      stddev = (1.0 / p.input_dims)**0.5
+      stddev = (1.0 / self.input_dims) ** 0.5
       gate_scale = stddev * 3.0**0.5
       gate_init = WeightInit.Uniform(gate_scale)
     gate_pc = WeightHParams(
-        shape=[p.input_dims, p.num_experts],
+        shape=[self.input_dims, self.num_experts],
         init=gate_init,
-        mesh_shape=p.mesh_shape,
-        tensor_split_dims_mapping=wp.me)
+        mesh_shape=self.mesh_shape,
+        tensor_split_dims_mapping=wp.me,
+    )
     logging.debug('moe gate WeightHParams %s', gate_pc)
     self.create_variable('gate', gate_pc)
 
@@ -679,51 +673,57 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     # emh tensor typically mesh-shard on first dim and last dim. Hence, here we
     # split the tensor manually into multiple tensors on the second dim.
     emh_shape = [
-        p.num_experts, p.input_dims // p.expert_weight_shards, p.hidden_dims
+        self.num_experts,
+        self.input_dims // self.expert_weight_shards,
+        self.hidden_dims,
     ]
     wi_init = None
-    if p.internal_gshard_variance_scaling_fan_in_init:
-      stddev = (1.0 / p.input_dims)**0.5
+    if self.internal_gshard_variance_scaling_fan_in_init:
+      stddev = (1.0 / self.input_dims) ** 0.5
       wi_init_scale = stddev * 3.0**0.5
       wi_init = WeightInit.Uniform(wi_init_scale)
     wi_pc = WeightHParams(
         shape=emh_shape,
         init=wi_init,
-        mesh_shape=p.mesh_shape,
-        tensor_split_dims_mapping=wp.emh)
+        mesh_shape=self.mesh_shape,
+        tensor_split_dims_mapping=wp.emh,
+    )
     logging.debug('moe wi WeightHParams %s', wi_pc)
-    for ii in range(p.expert_weight_shards):
+    for ii in range(self.expert_weight_shards):
       self.create_variable('wi_%d' % ii, wi_pc)
 
     # EHM Tensor (output transformation after RELU)
     # ehm tensor typically shard on the first dim and the second dim. Here we
     # manually split the tensor on the last dim into multiple tensors.
     ehm_shape = [
-        p.num_experts, p.hidden_dims, output_dims // p.expert_weight_shards
+        self.num_experts,
+        self.hidden_dims,
+        output_dims // self.expert_weight_shards,
     ]
     wo_init = None
-    if p.internal_gshard_variance_scaling_fan_in_init:
+    if self.internal_gshard_variance_scaling_fan_in_init:
       wi_init = None
-      stddev = (1.0 / p.hidden_dims)**0.5
+      stddev = (1.0 / self.hidden_dims) ** 0.5
       wo_init_scale = stddev * 3.0**0.5
       wo_init = WeightInit.Uniform(wo_init_scale)
     wo_pc = WeightHParams(
         shape=ehm_shape,
         init=wo_init,
-        mesh_shape=p.mesh_shape,
-        tensor_split_dims_mapping=wp.ehm)
+        mesh_shape=self.mesh_shape,
+        tensor_split_dims_mapping=wp.ehm,
+    )
     logging.debug('moe wo WeightHParams %s', wo_pc)
-    for ii in range(p.expert_weight_shards):
+    for ii in range(self.expert_weight_shards):
       self.create_variable('wo_%d' % ii, wo_pc)
 
   def _split(self, t_in, sharding):
-    return base_layer.maybe_shard(t_in, sharding, self.hparams.mesh_axis_names)
+    return base_layer.maybe_shard(t_in, sharding, self.mesh_axis_names)
 
   def _get_weights(self):
     """Get the expert weights."""
     theta_wis = []
     theta_wos = []
-    for ii in range(self.hparams.expert_weight_shards):
+    for ii in range(self.expert_weight_shards):
       theta_wis.append(getattr(self.theta, f'wi_{ii}'))
       theta_wos.append(getattr(self.theta, f'wo_{ii}'))
 
@@ -747,12 +747,11 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
 
   def _combine_top2_expert_outputs(self, inputs, paddings, segment_ids):
     """Combine outputs from top 2 experts directly."""
-    p = self.hparams
     fprop_dtype = self.fprop_dtype
-    ap = self.hparams.activation_split_dims_mapping
+    ap = self.activation_split_dims_mapping
 
     theta_wi, theta_wo = self._get_weights()
-    if p.moe_gating_embedding_level == 'sentence':
+    if self.moe_gating_embedding_level == 'sentence':
       if segment_ids is None and paddings is None:
         sentence_embeddings = jnp.tile(
             jnp.average(inputs, axis=1, keepdims=True), [1, inputs.shape[1], 1])
@@ -796,11 +795,10 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
 
   def _dispatch_and_combine_expert_outputs(self, inputs, paddings, segment_ids):
     """Combine expert outputs using GShard-style dispatch-combine tensors."""
-    p = self.hparams
     fprop_dtype = self.fprop_dtype
-    ap = p.activation_split_dims_mapping
-    output_dims = p.input_dims
-    assert p.gating_func != 'dense_top2'
+    ap = self.activation_split_dims_mapping
+    output_dims = self.input_dims
+    assert self.gating_func != 'dense_top2'
 
     theta_wi, theta_wo = self._get_weights()
 
@@ -810,11 +808,13 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     if paddings is not None:
       assert paddings.shape == token_shape
 
-    num_groups = p.num_groups
+    num_groups = self.num_groups
     assert num_groups
-    if (p.min_group_size is not None and
-        num_tokens / num_groups < p.min_group_size):
-      num_groups = (num_tokens + p.min_group_size - 1) // p.min_group_size
+    if (
+        self.min_group_size is not None
+        and num_tokens / num_groups < self.min_group_size
+    ):
+      num_groups = (num_tokens + self.min_group_size - 1) // self.min_group_size
       logging.info('num_groups adjusted to %s.', num_groups)
     if num_tokens % num_groups != 0:
       raise ValueError(f'The value of num_groups {num_groups} does not '
@@ -829,7 +829,7 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
       reshaped_paddings = reshaped_paddings.astype(fprop_dtype)
     else:
       reshaped_paddings = None
-    if p.moe_gating_embedding_level == 'sentence':
+    if self.moe_gating_embedding_level == 'sentence':
       if segment_ids is None and paddings is None:
         sentence_embeddings = jnp.tile(
             jnp.average(inputs, axis=1, keepdims=True), [1, inputs.shape[1], 1])
@@ -860,26 +860,27 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     # top2_gating_on_logits is stable in low-precision mode.
     # TODO(lepikhin): Validate stability. mask_dtype=np.int32 and
     # logits.astype(np.float32) should generally be sufficient.
-    if p.second_expert_policy == 'all':
+    if self.second_expert_policy == 'all':
       prng_key = None
     else:
       prng_key = self.next_prng_key()
     gating = gshard_utils.compute_gating(
         paddings=reshaped_paddings,
         logits=logits.astype(jnp.float32),
-        experts_dim=p.num_experts,
-        expert_capacity_dim=p.expert_capacity_dim,
+        experts_dim=self.num_experts,
+        expert_capacity_dim=self.expert_capacity_dim,
         fprop_dtype=fprop_dtype,
-        gating_func=p.gating_func,
+        gating_func=self.gating_func,
         prng_key=prng_key,
-        second_expert_policy=p.second_expert_policy,
+        second_expert_policy=self.second_expert_policy,
         second_expert_threshold=0.0,
         legacy_mtf_behavior=True,
-        capacity_factor=p.unadjusted_expert_capacity_factor,
+        capacity_factor=self.unadjusted_expert_capacity_factor,
         mask_dtype=jnp.int32,
-        gating_logit_cap=p.gating_logit_cap)
+        gating_logit_cap=self.gating_logit_cap,
+    )
 
-    if p.gating_func == 'top2':
+    if self.gating_func == 'top2':
       aux_loss, combine_tensor, dispatch_tensor, summary = gating
       over_capacity_1_ratio, over_capacity_2_ratio = summary
       self.add_summary('over_capacity_1_ratio', over_capacity_1_ratio)
@@ -891,27 +892,27 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
       dispatch_tensor = dispatch_tensor.astype(fprop_dtype)
 
     # both tensors have shape [g, s, e, c]
-    if p.gating_func in ['top2', 'expert_choice_v2']:
+    if self.gating_func in ['top2', 'expert_choice_v2']:
       combine_tensor = self._split(combine_tensor, ap.gsec)
       dispatch_tensor = self._split(dispatch_tensor, ap.gsec)
       expert_inputs = jnp.einsum('gsec,gsm->egcm', dispatch_tensor,
                                  reshaped_inputs)
-    elif p.gating_func == 'expert_choice':
+    elif self.gating_func == 'expert_choice':
       combine_tensor = self._split(combine_tensor, ap.gec)
       dispatch_tensor = self._split(dispatch_tensor, ap.gecs)
       expert_inputs = jnp.einsum('gecs,gsm->egcm', dispatch_tensor,
                                  reshaped_inputs)
     else:
-      raise ValueError('Unsupported gating function: %s ' % p.gating_func)
+      raise ValueError('Unsupported gating function: %s ' % self.gating_func)
     expert_inputs = self._split(expert_inputs, ap.egcm)
 
     hidden = jnp.einsum('egcm,emh->egch', expert_inputs, theta_wi)
     hidden = self._split(hidden, ap.egch)
 
-    if p.gating_func in ['top2', 'expert_choice_v2']:
+    if self.gating_func in ['top2', 'expert_choice_v2']:
       threshold = 0
-      activation_class_name = p.activation_tpl.cls.__name__
-      if isinstance(p.activation_tpl.cls, activations_lib.GELU):
+      activation_class_name = self.activation_tpl.cls.__name__
+      if isinstance(self.activation_tpl.cls, activations_lib.GELU):
         logging.info('Setting dead neuron count threshold=-3.0 '
                      'for approximate GeLU activation')
         threshold = -3.0
@@ -939,15 +940,15 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     # Now transpose and reshard.
     transposed_expert_output = jnp.einsum('egcm->gecm', expert_output)
     transposed_expert_output = self._split(transposed_expert_output, ap.gecm)
-    if p.gating_func in ['top2', 'expert_choice_v2']:
+    if self.gating_func in ['top2', 'expert_choice_v2']:
       combined_output = jnp.einsum('gecm,gsec->gsm', transposed_expert_output,
                                    combine_tensor)
-    elif p.gating_func == 'expert_choice':
+    elif self.gating_func == 'expert_choice':
       combined_output = jnp.einsum('gecm,gecs,gec->gsm',
                                    transposed_expert_output, dispatch_tensor,
                                    combine_tensor)
     else:
-      raise ValueError('Unsupported gating function: %s ' % p.gating_func)
+      raise ValueError('Unsupported gating function: %s ' % self.gating_func)
     combined_output = self._split(combined_output, ap.gsm)
 
     combined_output = combined_output.reshape(token_shape + (output_dims,))
@@ -968,25 +969,24 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     Returns:
       Tensor of the same shape as inputs.
     """
-    p = self.hparams
     # Assume output_dims == input_dims
     fprop_dtype = self.fprop_dtype
 
     # Consistent with gshard implementation.
-    if p.apply_padding_first and paddings is not None:
+    if self.apply_padding_first and paddings is not None:
       inputs *= (1.0 - jnp.expand_dims(paddings, axis=-1))
 
     # TODO(zhangqiaorjc): Handle input of shape [batch, seq_len, g, model/g]?
-    if p.norm_policy == 'primer_hybrid':
+    if self.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
-    elif p.norm_policy == 'pre':
+    elif self.norm_policy == 'pre':
       inputs_normalized = self.layer_norm(inputs)
     else:
       inputs_normalized = inputs
 
     assert len(inputs_normalized.shape) in [2, 3]
 
-    if p.gating_func == 'dense_top2':
+    if self.gating_func == 'dense_top2':
       combined_output, aux_loss = self._combine_top2_expert_outputs(
           inputs_normalized, paddings, segment_ids)
     else:
@@ -998,25 +998,26 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
       combined_output *= (1.0 -
                           jnp.expand_dims(paddings, -1)).astype(fprop_dtype)
     # Primer normalization before dropout.
-    if p.norm_policy == 'primer_hybrid':
+    if self.norm_policy == 'primer_hybrid':
       combined_output = self.post_layer_norm(combined_output)
-    elif p.norm_policy == 'post':
+    elif self.norm_policy == 'post':
       combined_output = self.layer_norm(combined_output)
     # Residual dropout.
     after_residual = self.residual_dropout(combined_output)
-    if p.add_skip_connection:
-      if p.residual_droppath_prob:
+    if self.add_skip_connection:
+      if self.residual_droppath_prob:
         out = self.residual_droppath(inputs, after_residual)
       else:
-        out = inputs + after_residual * p.residual_weight
+        out = inputs + after_residual * self.residual_weight
 
     # Add loss to a global collection. We don't return the loss to the caller
     # to avoid the change of the api here.
-    assert p.moe_load_balance_loss_weight, (
+    assert self.moe_load_balance_loss_weight, (
         'p.moe_load_balance_loss_weight > 0 when there is an aux '
-        'load balancing loss in MoE layers.')
+        'load balancing loss in MoE layers.'
+    )
     aux_loss = aux_loss.astype(fprop_dtype)
-    aux_loss *= p.moe_load_balance_loss_weight
+    aux_loss *= self.moe_load_balance_loss_weight
     self.add_summary('aux_moe_load_balance_loss', aux_loss)
     self.add_aux_loss('aux_moe_load_balance_loss', aux_loss)
 
@@ -1024,131 +1025,124 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
 
 
 class Transformer(base_layer.BaseLayer):
-  """Transformer layer with multi-headed attention."""
+  """Transformer layer with multi-headed attention.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      input_dims: Dimension of the transformer block input.
-      hidden_dims: Hidden dimension of FFN layer.
-      num_heads: Number of heads in self-attention.
-      dim_per_head: Dimension of each attention head. If None then dim_per_head
-        == hidden_dim // num_heads.
-      dropout_tpl: Residual dropout params template. keep_prop will be reset to
-        (1.0 - residual_dropout_prob).
-      atten_dropout_prob: Probability at which we apply dropout to the attention
-        weights.
-      residual_dropout_prob: Probability at which we apply dropout to the
-        residual layers, such that, residual(x, y) = (x + dropout(y)).
-      relu_dropout_prob: Probability at which we apply dropout to the FFN
-        layers.
-      residual_droppath_prob: Probability at which we drop the entire residual
-        path.
-      mask_self_attention: If True, use causal mask.
-      cross_attention: If True, perform cross encoder-decoder attention.
-      allow_skip_cross_attention: If True, allow skipping cross attention during
-        forward pass and decoding. This allows to skip cross attention when
-        cross inputs are not available. For example, if we want to train the
-        model with paired data and unimodal data. For paired data, we need cross
-        attention but for unimodal data, we don't have cross inputs.
-      cross_atten_tpl: Optional cross attention params template that can be set
-        when cross attention is enabled. If cross-attention is enabled and this
-        is set to None, then cross-attention params will be inherited from
-        tr_atten_tpl.
-      ln_tpl: Parameterization of the layer normalization layer.
-      norm_policy: Policy for applying normaliztion wrt. transformations.
-        Options are: (1) "pre", applied before transformation. (2)
-        "primer_hybrid", applied before and after transformation. (3) "post",
-        applied after transformation.
-      tr_atten_tpl: Parameterization of the DotProductAttention layer.
-      packed_input: If True, each training example may pack multiple sequences.
-      tr_fflayer_tpl: Parameterization of the transformer Feed-Forward Layer.
-      ngrammer_tpl: Params for the Ngrammer layer. This param must correspond to
-        the VQNgrammer layer. If this is None, then there is no NGrammer layer
-        present in this layer.
-    """
-    input_dims: int = 0
-    hidden_dims: int = 0
-    num_heads: Optional[int] = None
-    dim_per_head: Optional[int] = None
-    dropout_tpl: BaseHParams = sub_config_field(stochastics.Dropout.HParams)
-    atten_dropout_prob: float = 0.0
-    residual_dropout_prob: float = 0.0
-    relu_dropout_prob: float = 0.0
-    residual_droppath_prob: float = 0.0
-    mask_self_attention: bool = False
-    use_cross_attention: bool = False
-    allow_skip_cross_attention: bool = False
-    cross_atten_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
-    ln_tpl: BaseHParams = sub_config_field(normalizations.LayerNorm.HParams)
-    norm_policy: str = 'pre'
-    tr_atten_tpl: BaseHParams = sub_config_field(
-        attentions.DotProductAttention.HParams)
-    packed_input: bool = False
-    tr_fflayer_tpl: BaseHParams = sub_config_field(
-        TransformerFeedForward.HParams)
-    ngrammer_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
+  Attributes:
+    input_dims: Dimension of the transformer block input.
+    hidden_dims: Hidden dimension of FFN layer.
+    num_heads: Number of heads in self-attention.
+    dim_per_head: Dimension of each attention head. If None then dim_per_head ==
+      hidden_dim // num_heads.
+    dropout_tpl: Residual dropout params template. keep_prop will be reset to
+      (1.0 - residual_dropout_prob).
+    atten_dropout_prob: Probability at which we apply dropout to the attention
+      weights.
+    residual_dropout_prob: Probability at which we apply dropout to the residual
+      layers, such that, residual(x, y) = (x + dropout(y)).
+    relu_dropout_prob: Probability at which we apply dropout to the FFN layers.
+    residual_droppath_prob: Probability at which we drop the entire residual
+      path.
+    mask_self_attention: If True, use causal mask.
+    cross_attention: If True, perform cross encoder-decoder attention.
+    allow_skip_cross_attention: If True, allow skipping cross attention during
+      forward pass and decoding. This allows to skip cross attention when cross
+      inputs are not available. For example, if we want to train the model with
+      paired data and unimodal data. For paired data, we need cross attention
+      but for unimodal data, we don't have cross inputs.
+    cross_atten_tpl: Optional cross attention params template that can be set
+      when cross attention is enabled. If cross-attention is enabled and this is
+      set to None, then cross-attention params will be inherited from
+      tr_atten_tpl.
+    ln_tpl: Parameterization of the layer normalization layer.
+    norm_policy: Policy for applying normaliztion wrt. transformations. Options
+      are: (1) "pre", applied before transformation. (2) "primer_hybrid",
+      applied before and after transformation. (3) "post", applied after
+      transformation.
+    tr_atten_tpl: Parameterization of the DotProductAttention layer.
+    packed_input: If True, each training example may pack multiple sequences.
+    tr_fflayer_tpl: Parameterization of the transformer Feed-Forward Layer.
+    ngrammer_tpl: Params for the Ngrammer layer. This param must correspond to
+      the VQNgrammer layer. If this is None, then there is no NGrammer layer
+      present in this layer.
+  """
+  input_dims: int = 0
+  hidden_dims: int = 0
+  num_heads: Optional[int] = None
+  dim_per_head: Optional[int] = None
+  dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
+  atten_dropout_prob: float = 0.0
+  residual_dropout_prob: float = 0.0
+  relu_dropout_prob: float = 0.0
+  residual_droppath_prob: float = 0.0
+  mask_self_attention: bool = False
+  use_cross_attention: bool = False
+  allow_skip_cross_attention: bool = False
+  cross_atten_tpl: Optional[LayerTpl] = template_field(None)
+  ln_tpl: LayerTpl = template_field(normalizations.LayerNorm)
+  norm_policy: str = 'pre'
+  tr_atten_tpl: LayerTpl = template_field(attentions.DotProductAttention)
+  packed_input: bool = False
+  tr_fflayer_tpl: LayerTpl = template_field(TransformerFeedForward)
+  ngrammer_tpl: Optional[LayerTpl] = template_field(None)
 
   def setup(self) -> None:
-    p = self.hparams
 
     # Initialize Layer Norm
-    if p.norm_policy == 'primer_hybrid':
-      params = p.ln_tpl.clone()
-      params.dim = p.input_dims
+    if self.norm_policy == 'primer_hybrid':
+      params = self.ln_tpl.clone()
+      params.dim = self.input_dims
       self.create_child('pre_layer_norm', params)
       self.create_child('post_layer_norm', params)
-    elif p.norm_policy == 'pre' or p.norm_policy == 'post':
-      params = p.ln_tpl.clone()
+    elif self.norm_policy == 'pre' or self.norm_policy == 'post':
+      params = self.ln_tpl.clone()
       params.name = 'layer_norm'
-      params.dim = p.input_dims
+      params.dim = self.input_dims
       self.create_child('layer_norm', params)
     else:
-      raise ValueError('Unrecognized norm_policy: %s' % p.norm_policy)
+      raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
     # Initialize multi-headed self-attention
-    params = p.tr_atten_tpl.clone()
+    params = self.tr_atten_tpl.clone()
     params.name = 'multihead_self_atten'
-    params.input_dim = p.input_dims
-    params.hidden_dim = p.input_dims
-    params.num_heads = p.num_heads
-    params.dim_per_head = p.dim_per_head
-    params.atten_dropout_prob = p.atten_dropout_prob
-    if p.ngrammer_tpl:
-      params.ngrammer_tpl = p.ngrammer_tpl
+    params.input_dim = self.input_dims
+    params.hidden_dim = self.input_dims
+    params.num_heads = self.num_heads
+    params.dim_per_head = self.dim_per_head
+    params.atten_dropout_prob = self.atten_dropout_prob
+    if self.ngrammer_tpl:
+      params.ngrammer_tpl = self.ngrammer_tpl
     self.create_child('self_attention', params)
 
     # Initialize residual dropout.
-    params = p.dropout_tpl.clone()
-    params.keep_prob = (1.0 - p.residual_dropout_prob)
+    params = self.dropout_tpl.clone()
+    params.keep_prob = 1.0 - self.residual_dropout_prob
     self.create_child('residual_dropout', params)
 
     # Initialize multi-headed cross-attention and layer norm.
-    if p.use_cross_attention:
-      if p.norm_policy in ('pre', 'post'):
-        params = p.ln_tpl.clone()
+    if self.use_cross_attention:
+      if self.norm_policy in ('pre', 'post'):
+        params = self.ln_tpl.clone()
         params.name = 'cross_layer_norm'
-        params.dim = p.input_dims
+        params.dim = self.input_dims
         self.create_child('cross_layer_norm', params)
-      elif p.norm_policy == 'primer_hybrid':
-        params = p.ln_tpl.clone()
-        params.dim = p.input_dims
+      elif self.norm_policy == 'primer_hybrid':
+        params = self.ln_tpl.clone()
+        params.dim = self.input_dims
         self.create_child('pre_cross_layer_norm', params)
         self.create_child('post_cross_layer_norm', params)
       else:
-        raise ValueError(f'Unrecognized norm_policy: {p.norm_policy}')
+        raise ValueError(f'Unrecognized norm_policy: {self.norm_policy}')
 
-      if p.cross_atten_tpl is not None:
-        params = p.cross_atten_tpl.clone()
+      if self.cross_atten_tpl is not None:
+        params = self.cross_atten_tpl.clone()
       else:
-        params = p.tr_atten_tpl.clone()
+        params = self.tr_atten_tpl.clone()
       params.name = 'multihead_cross_atten'
-      params.input_dim = p.input_dims
-      params.hidden_dim = p.input_dims
-      params.num_heads = p.num_heads
-      params.dim_per_head = p.dim_per_head
-      params.atten_dropout_prob = p.atten_dropout_prob
+      params.input_dim = self.input_dims
+      params.hidden_dim = self.input_dims
+      params.num_heads = self.num_heads
+      params.dim_per_head = self.dim_per_head
+      params.atten_dropout_prob = self.atten_dropout_prob
       # Note that cross attention should not use any position embeddings.
       if params.use_rotary_position_emb:
         raise ValueError('Rotary position embedding should not be enabled for '
@@ -1160,22 +1154,24 @@ class Transformer(base_layer.BaseLayer):
       self.create_child('cross_attention', params)
 
     # Initialize residual droppath
-    if p.residual_droppath_prob > 0:
-      droppath_p = stochastics.StochasticResidual.HParams(
+    if self.residual_droppath_prob > 0:
+      droppath_p = pax_fiddle.Config(
+          stochastics.StochasticResidual,
           name='residual_droppath',
-          survival_prob=1.0 - p.residual_droppath_prob)
+          survival_prob=1.0 - self.residual_droppath_prob,
+      )
       self.create_child('residual_droppath', droppath_p)
 
     # Initialize feed-forward layer
-    if p.tr_fflayer_tpl:
-      params = p.tr_fflayer_tpl.clone()
+    if self.tr_fflayer_tpl:
+      params = self.tr_fflayer_tpl.clone()
       params.name = 'tr_fflayer'
-      params.input_dims = p.input_dims
-      params.hidden_dims = p.hidden_dims
-      params.relu_dropout_prob = p.relu_dropout_prob
-      params.residual_dropout_prob = p.residual_dropout_prob
-      params.residual_droppath_prob = p.residual_droppath_prob
-      params.norm_policy = p.norm_policy
+      params.input_dims = self.input_dims
+      params.hidden_dims = self.hidden_dims
+      params.relu_dropout_prob = self.relu_dropout_prob
+      params.residual_dropout_prob = self.residual_dropout_prob
+      params.residual_droppath_prob = self.residual_droppath_prob
+      params.norm_policy = self.norm_policy
       self.create_child('ff_layer', params)
 
   def init_states(self, target_batch_size: int, target_max_length: int) -> None:
@@ -1223,17 +1219,15 @@ class Transformer(base_layer.BaseLayer):
       The fflayer output with shape [B, T, D].
       atten_probs: A NestedMap with keys `self_atten` <float>[B, N, T, T].
     """
-    # Layer normalize input
-    p = self.hparams
 
     inputs_stats = stats.compute_stats(inputs, jnp.expand_dims(paddings, -1))
     self.add_summary('xformer_input_mean', inputs_stats.mean_v, verbosity=3)
     self.add_summary('xformer_input_std', inputs_stats.std_v, verbosity=3)
     self.add_summary('xformer_input_abs_max', inputs_stats.max_v, verbosity=3)
 
-    if p.norm_policy == 'primer_hybrid':
+    if self.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
-    elif p.norm_policy == 'pre':
+    elif self.norm_policy == 'pre':
       inputs_normalized = self.layer_norm(inputs)
     else:
       inputs_normalized = inputs
@@ -1247,30 +1241,31 @@ class Transformer(base_layer.BaseLayer):
         query_segment_pos=segment_pos,
         key_segment_pos=segment_pos)
     atten_probs = NestedMap(self_atten=self_atten_probs)
-    if p.norm_policy == 'primer_hybrid':
+    if self.norm_policy == 'primer_hybrid':
       atten_output = self.post_layer_norm(atten_output)
-    elif p.norm_policy == 'post':
+    elif self.norm_policy == 'post':
       atten_output = self.layer_norm(atten_output)
 
     # Residual dropout and connection
     atten_output = self.residual_dropout(atten_output)
 
     # Apply skip connection
-    if p.residual_droppath_prob > 0.0:
+    if self.residual_droppath_prob > 0.0:
       atten_output = self.residual_droppath(inputs, atten_output)
     else:
       atten_output += inputs
 
     # Apply cross attention if applicable
-    if p.use_cross_attention and (not p.allow_skip_cross_attention or
-                                  cross_inputs is not None):
+    if self.use_cross_attention and (
+        not self.allow_skip_cross_attention or cross_inputs is not None
+    ):
       assert cross_inputs is not None
       assert cross_attention_mask is not None
-      if p.norm_policy == 'pre':
+      if self.norm_policy == 'pre':
         atten_output_normalized = self.cross_layer_norm(atten_output)
-      elif p.norm_policy == 'primer_hybrid':
+      elif self.norm_policy == 'primer_hybrid':
         atten_output_normalized = self.pre_cross_layer_norm(atten_output)
-      elif p.norm_policy == 'post':
+      elif self.norm_policy == 'post':
         atten_output_normalized = atten_output
 
       cross_atten_output, cross_atten_probs = self.cross_attention(
@@ -1280,15 +1275,15 @@ class Transformer(base_layer.BaseLayer):
           atten_mask=cross_attention_mask)
       atten_probs.cross_atten = cross_atten_probs
 
-      if p.norm_policy == 'post':
+      if self.norm_policy == 'post':
         cross_atten_output = self.cross_layer_norm(cross_atten_output)
-      elif p.norm_policy == 'primer_hybrid':
+      elif self.norm_policy == 'primer_hybrid':
         cross_atten_output = self.post_cross_layer_norm(cross_atten_output)
 
       # Residual dropout and connection
       cross_atten_output = self.residual_dropout(cross_atten_output)
 
-      if p.residual_droppath_prob > 0.0:
+      if self.residual_droppath_prob > 0.0:
         atten_output = self.residual_droppath(atten_output, cross_atten_output)
       else:
         atten_output += cross_atten_output
@@ -1326,8 +1321,10 @@ class Transformer(base_layer.BaseLayer):
       segment_pos:    [B] or [B, L], the current position in the same segment.
         If unspecified, time_step will be used.
 
-      attention_mask: [B, 1|L, T], per step attention mask for this time step.
-        This combines causal mask with any segment mask if applicable.
+      attention_mask: [B, 1, L, S] if extends multiple steps (i.e. `inputs` is
+        of shape [B, L, D]) or [B, 1, T] if extends one step (i.e. `inputs` is
+        of shape [B, D]), optional attention mask for this time step. This
+        combines causal mask with any segment mask if applicable.
       cross_attention_mask: [b|B, 1, 1 S], optional, cross_segment_mask for
         this time step. This combines padding mask with any segment mask if
         applicable.
@@ -1335,12 +1332,10 @@ class Transformer(base_layer.BaseLayer):
     Returns:
       output: [B, D] or [B, L, D].
     """
-    # pyformat:enabled
-    p = self.hparams
     # Layer normalize input
-    if p.norm_policy == 'primer_hybrid':
+    if self.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
-    elif p.norm_policy == 'pre':
+    elif self.norm_policy == 'pre':
       inputs_normalized = self.layer_norm(inputs)
 
     # Self-attention layer.
@@ -1349,9 +1344,9 @@ class Transformer(base_layer.BaseLayer):
         atten_mask=attention_mask,
         time_step=time_step,
         segment_pos=segment_pos)
-    if p.norm_policy == 'primer_hybrid':
+    if self.norm_policy == 'primer_hybrid':
       atten_output = self.post_layer_norm(atten_output)
-    elif p.norm_policy == 'post':
+    elif self.norm_policy == 'post':
       atten_output = self.layer_norm(atten_output)
 
     # Residual dropout and connection
@@ -1359,14 +1354,15 @@ class Transformer(base_layer.BaseLayer):
     atten_output += inputs
 
     # Apply cross attention if applicable
-    if p.use_cross_attention and (not p.allow_skip_cross_attention or
-                                  cross_attention_mask is not None):
+    if self.use_cross_attention and (
+        not self.allow_skip_cross_attention or cross_attention_mask is not None
+    ):
       assert cross_attention_mask is not None
-      if p.norm_policy == 'pre':
+      if self.norm_policy == 'pre':
         atten_output_normalized = self.cross_layer_norm(atten_output)
-      elif p.norm_policy == 'primer_hybrid':
+      elif self.norm_policy == 'primer_hybrid':
         atten_output_normalized = self.pre_cross_layer_norm(atten_output)
-      elif p.norm_policy == 'post':
+      elif self.norm_policy == 'post':
         atten_output_normalized = atten_output
 
       cross_atten_output = self.cross_attention.extend_step(
@@ -1376,9 +1372,9 @@ class Transformer(base_layer.BaseLayer):
           segment_pos=segment_pos,
           is_cross_attention=True)
 
-      if p.norm_policy == 'post':
+      if self.norm_policy == 'post':
         cross_atten_output = self.cross_layer_norm(cross_atten_output)
-      elif p.norm_policy == 'primer_hybrid':
+      elif self.norm_policy == 'primer_hybrid':
         cross_atten_output = self.post_cross_layer_norm(cross_atten_output)
 
       # Residual dropout and connection
@@ -1418,145 +1414,145 @@ class Transformer(base_layer.BaseLayer):
 
 
 class StackedTransformer(base_layer.BaseLayer):
-  """A stack of Transformer layers."""
+  """A stack of Transformer layers.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
-
-    Attributes:
-      use_cross_attention: If True, introduces cross encoder-decoder attention
-        layer.
-      mask_self_attention: Use masked self-attention.
-      num_layers: Number of layers in this stack.
-      model_dims: Model dimension in Transformer layers.
-      hidden_dims: The hidden layer dimension of FFN in Transformer layers.
-      num_heads: Number of attention heads.
-      dim_per_head: Dimension of each attention head. If None then dim_per_head
-        == hidden_dim // num_heads.
-      dropout_prob: Apply dropout at this prob at various places.
-      residual_droppath_prob: Probability at which we drop the entire residual
-        path.
-      input_dropout_prob: Dropout probability applied to the input before any
-        processing happens.
-      gating_func: Gating function type--can be one of the following options:
-        'top2', based on the GShard paper: https://arxiv.org/abs/2006.16668,
-        'expert_choice', based on https://arxiv.org/abs/2202.09368,
-        'dense_top2': experimental gating function for decodiing. Similar to
-        'top2' gating, but no capacity constrainst for each expert.
-      unadjusted_expert_capacity_factor: Unadjusted expert capacity_factor. This
-        is the ratio between global batch size and total capacity across all
-        experts and all routing groups.
-      transformer_layer_params_tpl: A template of Transformer.params, can be a
-        list of params of length equal to the num_layers or a factor of
-        num_layers. For a factor, the params are tiled as [a, a, ..., b,
-        b,...,].
-      packed_input: If True, each training example may pack multiple sequences.
-      fold_padding_with_segment_mask: If True then segment mask is supposed to
-        include the padding mask as well, i.e. treating PADs as one sequence and
-        non-PADs as another.
-      moe_layer_tpl: Template configuration for the moe feedforward layer.
-      num_experts: Total number of experts.
-      num_groups: Number of groups for dispathcing.
-      min_group_size: If not None, num_groups will be adjusted so that there
-        will be at least min_group_size tokens in each group.
-      moe_layers: List of MoE layer indices, e.g. [0, 2, 4].
-      ngrammer_tpls: Sequence of params for the Ngrammer layer. This param is
-        shared between the Ngrammer layer as well as the VQNgrammer layer. The
-        length of the sequence must match the number of attention layers. If an
-        entry in the sequence is None, then there is no NGrammer layer present
-        in that corresponding layer.
-    """
-    use_cross_attention: bool = False
-    mask_self_attention: bool = False
-    num_layers: int = 0
-    model_dims: int = 0
-    hidden_dims: int = 0
-    num_heads: int = 0
-    dim_per_head: Optional[int] = None
-    dropout_prob: float = 0.0
-    atten_dropout_prob: Optional[float] = None
-    residual_dropout_prob: Optional[float] = None
-    relu_dropout_prob: Optional[float] = None
-    residual_droppath_prob: float = 0.0
-    input_dropout_prob: float = 0.0
-    gating_func: str = 'top2'
-    unadjusted_expert_capacity_factor: float = 2.0
-    transformer_layer_params_tpl: Union[
-        BaseHParams,
-        Sequence[BaseHParams]] = sub_config_field(Transformer.HParams)
-    packed_input: bool = False
-    fold_padding_with_segment_mask: bool = False
-    moe_layer_tpl: BaseHParams = sub_config_field(
-        TransformerFeedForwardMoe.HParams)
-    num_experts: int = 0
-    num_groups: int = 1
-    min_group_size: Optional[int] = None
-    moe_layers: Optional[Sequence[int]] = ()
-    ngrammer_tpls: Optional[Sequence[BaseHParams]] = sub_config_field(None)
+  Attributes:
+    use_cross_attention: If True, introduces cross encoder-decoder attention
+      layer.
+    mask_self_attention: Use masked self-attention.
+    num_layers: Number of layers in this stack.
+    model_dims: Model dimension in Transformer layers.
+    hidden_dims: The hidden layer dimension of FFN in Transformer layers.
+    num_heads: Number of attention heads.
+    dim_per_head: Dimension of each attention head. If None then dim_per_head ==
+      model_dims // num_heads.
+    dropout_prob: Apply dropout at this prob at various places.
+    residual_droppath_prob: Probability at which we drop the entire residual
+      path.
+    input_dropout_prob: Dropout probability applied to the input before any
+      processing happens.
+    gating_func: Gating function type--can be one of the following options:
+      'top2', based on the GShard paper: https://arxiv.org/abs/2006.16668,
+      'expert_choice', based on https://arxiv.org/abs/2202.09368, 'dense_top2':
+      experimental gating function for decodiing. Similar to 'top2' gating, but
+      no capacity constrainst for each expert.
+    unadjusted_expert_capacity_factor: Unadjusted expert capacity_factor. This
+      is the ratio between global batch size and total capacity across all
+      experts and all routing groups.
+    transformer_layer_params_tpl: A template of Transformer.params, can be a
+      list of params of length equal to the num_layers or a factor of
+      num_layers. For a factor, the params are tiled as [a, a, ..., b, b,...,].
+    packed_input: If True, each training example may pack multiple sequences.
+    fold_padding_with_segment_mask: If True then segment mask is supposed to
+      include the padding mask as well, i.e. treating PADs as one sequence and
+      non-PADs as another.
+    moe_layer_tpl: Template configuration for the moe feedforward layer.
+    num_experts: Total number of experts.
+    num_groups: Number of groups for dispathcing.
+    min_group_size: If not None, num_groups will be adjusted so that there will
+      be at least min_group_size tokens in each group.
+    moe_layers: List of MoE layer indices, e.g. [0, 2, 4].
+    ngrammer_tpls: Sequence of params for the Ngrammer layer. This param is
+      shared between the Ngrammer layer as well as the VQNgrammer layer. The
+      length of the sequence must match the number of attention layers. If an
+      entry in the sequence is None, then there is no NGrammer layer present in
+      that corresponding layer.
+  """
+  use_cross_attention: bool = False
+  mask_self_attention: bool = False
+  num_layers: int = 0
+  model_dims: int = 0
+  hidden_dims: int = 0
+  num_heads: int = 0
+  dim_per_head: Optional[int] = None
+  dropout_prob: float = 0.0
+  atten_dropout_prob: Optional[float] = None
+  residual_dropout_prob: Optional[float] = None
+  relu_dropout_prob: Optional[float] = None
+  residual_droppath_prob: float = 0.0
+  input_dropout_prob: float = 0.0
+  gating_func: str = 'top2'
+  unadjusted_expert_capacity_factor: float = 2.0
+  transformer_layer_params_tpl: Union[LayerTpl, Sequence[LayerTpl]] = (
+      template_field(Transformer)
+  )
+  packed_input: bool = False
+  fold_padding_with_segment_mask: bool = False
+  moe_layer_tpl: Optional[LayerTpl] = template_field(TransformerFeedForwardMoe)
+  num_experts: int = 0
+  num_groups: int = 1
+  min_group_size: Optional[int] = None
+  moe_layers: Optional[Sequence[int]] = ()
+  ngrammer_tpls: Optional[Sequence[LayerTpl]] = template_field(None)
 
   def setup(self) -> None:
-    p = self.hparams
 
-    assert p.num_layers > 0
-    assert p.model_dims > 0
-    assert p.hidden_dims > 0
-    assert p.num_heads > 0
-    assert 0.0 <= p.dropout_prob < 1.0
-    assert 0.0 <= p.input_dropout_prob < 1.0
+    assert self.num_layers > 0
+    assert self.model_dims > 0
+    assert self.hidden_dims > 0
+    assert self.num_heads > 0
+    assert 0.0 <= self.dropout_prob < 1.0
+    assert 0.0 <= self.input_dropout_prob < 1.0
 
     def _layer_params(i):
       """Construct i-th layer params."""
-      if isinstance(p.transformer_layer_params_tpl, (list, tuple)):
-        factor = p.num_layers // len(p.transformer_layer_params_tpl)
+      if isinstance(self.transformer_layer_params_tpl, Sequence):
+        factor = self.num_layers // len(self.transformer_layer_params_tpl)
         ii = i // factor
-        p_i = p.transformer_layer_params_tpl[ii].clone()
+        p_i = self.transformer_layer_params_tpl[ii].clone()
       else:
-        p_i = p.transformer_layer_params_tpl.clone()
+        p_i = self.transformer_layer_params_tpl.clone()
       p_i.name = f'layer_{i}'
-      p_i.use_cross_attention = p.use_cross_attention
-      p_i.mask_self_attention = p.mask_self_attention
-      p_i.num_heads = p.num_heads
-      p_i.dim_per_head = p.dim_per_head
-      p_i.input_dims = p.model_dims
-      p_i.packed_input = p.packed_input
-      p_i.atten_dropout_prob = p.atten_dropout_prob or p.dropout_prob
-      p_i.residual_dropout_prob = p.residual_dropout_prob or p.dropout_prob
-      p_i.relu_dropout_prob = p.relu_dropout_prob or p.dropout_prob
-      p_i.hidden_dims = p.hidden_dims
+      p_i.use_cross_attention = self.use_cross_attention
+      p_i.mask_self_attention = self.mask_self_attention
+      p_i.num_heads = self.num_heads
+      p_i.dim_per_head = self.dim_per_head
+      p_i.input_dims = self.model_dims
+      p_i.packed_input = self.packed_input
+      p_i.atten_dropout_prob = self.atten_dropout_prob or self.dropout_prob
+      p_i.residual_dropout_prob = (
+          self.residual_dropout_prob or self.dropout_prob
+      )
+      p_i.relu_dropout_prob = self.relu_dropout_prob or self.dropout_prob
+      p_i.hidden_dims = self.hidden_dims
 
-      if p.residual_droppath_prob > 0.0:
+      if self.residual_droppath_prob > 0.0:
         p_i.residual_droppath_prob = (
-            p.residual_droppath_prob * i / max(1, p.num_layers))
+            self.residual_droppath_prob * i / max(1, self.num_layers)
+        )
 
-      if p.moe_layers and i in p.moe_layers:
-        assert p.num_experts > 0
-        moe_p = p.moe_layer_tpl.clone()
-        moe_p.num_experts = p.num_experts
-        moe_p.num_groups = p.num_groups
-        moe_p.min_group_size = p.min_group_size
-        moe_p.gating_func = p.gating_func
+      if self.moe_layers and i in self.moe_layers:
+        assert self.num_experts > 0
+        moe_p = self.moe_layer_tpl.clone()
+        moe_p.num_experts = self.num_experts
+        moe_p.num_groups = self.num_groups
+        moe_p.min_group_size = self.min_group_size
+        moe_p.gating_func = self.gating_func
         if moe_p.hidden_dims:
           # MoE hidden_dims could be different from FFN hidden_dims
           p_i.hidden_dims = moe_p.hidden_dims
         p_i.tr_fflayer_tpl = moe_p
 
-      if p.ngrammer_tpls is not None:
-        if p.ngrammer_tpls[i] is not None:
-          p_i.ngrammer_tpl = p.ngrammer_tpls[i]
+      if self.ngrammer_tpls is not None:
+        if self.ngrammer_tpls[i] is not None:
+          p_i.ngrammer_tpl = self.ngrammer_tpls[i]
       return p_i
 
-    if isinstance(p.transformer_layer_params_tpl, (list, tuple)):
-      if p.num_layers % len(p.transformer_layer_params_tpl):
+    if isinstance(self.transformer_layer_params_tpl, (list, tuple)):
+      if self.num_layers % len(self.transformer_layer_params_tpl):
         raise ValueError('num_layers should be divisible by '
                          'transformer_layer_params_tpl')
 
-    layer_params = [_layer_params(i) for i in range(p.num_layers)]
+    layer_params = [_layer_params(i) for i in range(self.num_layers)]
     self.create_children('x_layers', layer_params)
 
-    if p.input_dropout_prob > 0.0:
+    if self.input_dropout_prob > 0.0:
       self.create_child(
           'input_dropout',
-          stochastics.Dropout.HParams(keep_prob=1.0 - p.input_dropout_prob))
+          pax_fiddle.Config(
+              stochastics.Dropout, keep_prob=1.0 - self.input_dropout_prob
+          ),
+      )
 
   def init_states(self, *args: Any, **kwargs: Any) -> None:
     """Initialize the cache for the StackedTransformer layer.
@@ -1595,31 +1591,31 @@ class StackedTransformer(base_layer.BaseLayer):
     Returns:
       Output vector with shape [B, T, D].
     """
-    p = self.hparams
     x_out = inputs
-    if p.packed_input:
+    if self.packed_input:
       assert segment_mask is not None
 
-    if p.use_cross_attention:
+    if self.use_cross_attention:
       assert cross_inputs is not None
       assert cross_paddings is not None
-      if p.packed_input:
+      if self.packed_input:
         assert cross_segment_mask is not None
 
     attention_mask, cross_attention_mask = compute_attention_masks_for_fprop(
         inputs,
         paddings,
-        p.mask_self_attention,
+        self.mask_self_attention,
         segment_mask,
         cross_inputs,
         cross_paddings,
         cross_segment_mask,
-        fold_padding_with_segment_mask=p.fold_padding_with_segment_mask)
+        fold_padding_with_segment_mask=self.fold_padding_with_segment_mask,
+    )
 
-    if p.input_dropout_prob > 0.0:
+    if self.input_dropout_prob > 0.0:
       x_out = self.input_dropout(x_out)
 
-    for i in range(p.num_layers):
+    for i in range(self.num_layers):
       x_in = x_out
       x_out, _ = self.x_layers[i](
           x_in,
@@ -1628,6 +1624,7 @@ class StackedTransformer(base_layer.BaseLayer):
           cross_inputs,
           cross_attention_mask,
           segment_pos=segment_pos)
+      x_out = checkpoint_name(x_out, 'transformer_layer_out')
     return x_out
 
   def extend_step(self,
@@ -1651,23 +1648,21 @@ class StackedTransformer(base_layer.BaseLayer):
       time_step:      a 0-based scalar, the current decode step.
       segment_pos:    [B] or [B, L], the current position in the same segment.
         If unspecified, time_step will be used.
-      atten_mask:     [B, 1, L, S], optional. If None, a causal mask on a
-        contiguous sequence is used by default. This is unsupported for
-        cross-attention.
+      atten_mask:     [B, 1, S] or [B, 1, L, S], optional. If None, a causal
+        mask on a contiguous sequence is used by default. This is unsupported
+        for cross-attention.
       cross_paddings: [B|b, S], optional 0/1 JTensor.
       cross_segment_mask: [B|b, 1, S], optional.
 
     Returns:
       decoder_output: [B, D], the last decoder layer output.
     """
-    p = self.hparams
 
-    max_t = self.x_layers[0].self_attention.decoding_state_sequence_length()
-
-    if p.use_cross_attention:
+    if self.use_cross_attention:
       assert cross_paddings is not None
 
     if atten_mask is None:
+      max_t = self.x_layers[0].self_attention.decoding_state_sequence_length()
       if segment_pos is None:
         segment_mask = None
       else:
@@ -1691,7 +1686,7 @@ class StackedTransformer(base_layer.BaseLayer):
                                                   segment_mask, cross_paddings,
                                                   cross_segment_mask))
     else:
-      if p.use_cross_attention:
+      if self.use_cross_attention:
         raise NotImplementedError('cross attention does not support customized '
                                   'attention_mask passed in yet.')
 
@@ -1741,28 +1736,25 @@ class StackedTransformer(base_layer.BaseLayer):
 
 
 class StackedTransformerRepeated(base_layer.BaseLayer):
-  """A StackedTransformer implemented using the generic Repeat."""
+  """A StackedTransformer implemented using the generic Repeat.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
+  Attributes:
+    block: The params of a block. A block can be a single transformer
+      layer,multiple layers, or a dense layer followed by a sparse layer, a.k.a.
+      MOE block.
+    x_times: Num times to repeat a block.
+    checkpoint_policy: How to checkpoint residuals for BProp: save nothing, dot
+      only or dot with no batch dimensions.
+    unroll_in_decode: Whether to unroll the layers during extend_step.
+  """
+  block: LayerTpl = template_field(StackedTransformer)
+  x_times: int = 0
+  checkpoint_policy: repeats.AutodiffCheckpointType = repeats.AutodiffCheckpointType.SAVE_NOTHING
+  unroll_in_decode: bool = True
+  repeat_layer_name: str = 'repeat'
+  sublayer_name: str = 'sub'
 
-    Attributes:
-      block: The params of a block. A block can be a single transformer
-        layer,multiple layers, or a dense layer followed by a sparse layer,
-        a.k.a. MOE block.
-      x_times: Num times to repeat a block.
-      checkpoint_policy: How to checkpoint residuals for BProp: save nothing,
-        dot only or dot with no batch dimensions.
-      unroll_in_decode: Whether to unroll the layers during extend_step.
-    """
-    block: BaseHParams = sub_config_field(StackedTransformer.HParams)
-    x_times: int = 0
-    checkpoint_policy: repeats.AutodiffCheckpointType = repeats.AutodiffCheckpointType.SAVE_NOTHING
-    unroll_in_decode: bool = True
-    repeat_layer_name: str = 'repeat'
-    sublayer_name: str = 'sub'
-
-  class WeightShardingHParams(BaseWtShardingHParams):
+  class WeightSharding(base_layer.BaseLayer.WeightSharding):
     """Represents how layer's learned parameters are partitioned across a mesh.
 
     Attributes:
@@ -1771,23 +1763,24 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
     block: SplitDimsMapping = None
 
   def setup(self) -> None:
-    p = self.hparams
-    wp = p.weight_split_dims_mapping
+    wp = self.weight_split_dims_mapping
 
-    repeat_l_params = repeats.Repeat.HParams(
-        sub_tpl=p.block,
-        x_times=p.x_times,
-        checkpoint_policy=p.checkpoint_policy,
+    repeat_l_params = pax_fiddle.Config(
+        repeats.Repeat,
+        sub_tpl=self.block,
+        x_times=self.x_times,
+        checkpoint_policy=self.checkpoint_policy,
         unpack_summaries=True,
-        unroll_in_decode=p.unroll_in_decode,
-        sublayer_name=p.sublayer_name)
+        unroll_in_decode=self.unroll_in_decode,
+        sublayer_name=self.sublayer_name,
+    )
     repeat_l_params.weight_split_dims_mapping.sub = wp.block
 
-    self.create_child(self.hparams.repeat_layer_name, repeat_l_params)
+    self.create_child(self.repeat_layer_name, repeat_l_params)
 
   @property
   def repeat_layer(self) -> repeats.Repeat:
-    return getattr(self, self.hparams.repeat_layer_name)
+    return getattr(self, self.repeat_layer_name)
 
   def __call__(self,
                inputs: JTensor,
@@ -1853,10 +1846,10 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
       time_step: A scalar, the current decode step, 0-based.
       segment_pos: An optional JTensor of shape [B]. Current position in the
         same segment. If unspecified, time_step will be used.
-      atten_mask: An optional JTensor of shape [B, 1, L, S] for attention mask
-        between inputs and the whole sequence. If it is None, it will be
-        computed as a causal mask on a contiguous sequence. This passed in
-        atten_mask is unsupported with cross-attention.
+      atten_mask: An optional JTensor of shape [B, 1, L, S] or [B, 1, S] for
+        attention mask between inputs and the whole sequence. If it is None, it
+        will be computed as a causal mask on a contiguous sequence. This passed
+        in atten_mask is unsupported with cross-attention.
       cross_paddings: Source paddings - [b|B, S].
       cross_segment_mask: if not None, cross_segment_mask for this time step, of
         shape [b|B, 1, S].
@@ -1902,34 +1895,31 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
 
 
 class PipelinedTransformer(base_layer.BaseLayer):
-  """A pipelined Transformer."""
+  """A pipelined Transformer.
 
-  class HParams(BaseHParams):
-    """Associated hyper-params for this layer class.
+  Attributes:
+    pipeline_stage: The layer params of each stage.
+    circular_repeat: Number of round-robin layers in each stage for the circular
+      pipeline schedule. If 1, this will be basic GPipe schedule.
+    num_pipeline_stages: Number of pipeline stages.
+    num_pipeline_microbatches: Number of pipeline microbatches.
+    pipeline_microbatch_size: Size of each pipeline microbatch.
+    stream_io: Whether to enable input/output streaming across stages. This is
+      typically useful for DCN.
+    pipeline_broadcast_inputs: If true, broadcast inputs (shared between all
+      stages instead of being computed by the previous stage) will be passed
+      stage-by-stage instead of being replicated.
+  """
+  pipeline_stage: LayerTpl = template_field(StackedTransformer)
+  circular_repeat: int = 1
+  num_pipeline_stages: Optional[int] = None
+  num_pipeline_microbatches: Optional[int] = None
+  pipeline_microbatch_size: Optional[int] = None
+  stream_io: bool = False
+  pipeline_broadcast_inputs: bool = False
+  checkpoint_policy: AutodiffCheckpointType = AutodiffCheckpointType.SAVE_ITERATION_INPUT
 
-    Attributes:
-      pipeline_stage: The layer params of each stage.
-      circular_repeat: Number of round-robin layers in each stage for the
-        circular pipeline schedule. If 1, this will be basic GPipe schedule.
-      num_pipeline_stages: Number of pipeline stages.
-      num_pipeline_microbatches: Number of pipeline microbatches.
-      pipeline_microbatch_size: Size of each pipeline microbatch.
-      stream_io: Whether to enable input/output streaming across stages. This is
-        typically useful for DCN.
-      pipeline_broadcast_inputs: If true, broadcast inputs (shared between all
-        stages instead of being computed by the previous stage) will be passed
-        stage-by-stage instead of being replicated.
-    """
-    pipeline_stage: BaseHParams = sub_config_field(StackedTransformer.HParams)
-    circular_repeat: int = 1
-    num_pipeline_stages: Optional[int] = None
-    num_pipeline_microbatches: Optional[int] = None
-    pipeline_microbatch_size: Optional[int] = None
-    stream_io: bool = False
-    pipeline_broadcast_inputs: bool = False
-    checkpoint_policy: AutodiffCheckpointType = AutodiffCheckpointType.SAVE_ITERATION_INPUT
-
-  class WeightShardingHParams(BaseWtShardingHParams):
+  class WeightSharding(base_layer.BaseLayer.WeightSharding):
     """Represents how layer's learned parameters are partitioned across a mesh.
 
     Attributes:
@@ -1937,7 +1927,7 @@ class PipelinedTransformer(base_layer.BaseLayer):
     """
     stages: SplitDimsMapping = (None,)
 
-  class ActivationShardingHParams(BaseActShardingHParams):
+  class ActivationSharding(base_layer.BaseLayer.ActivationSharding):
     """Represents how intermediate values should be partitioned across a mesh.
 
     Attributes:
@@ -1946,36 +1936,40 @@ class PipelinedTransformer(base_layer.BaseLayer):
     final_out: SplitDimsMapping = None
 
   def setup(self) -> None:
-    p = self.hparams
-    assert p.num_pipeline_stages > 0
+    assert self.num_pipeline_stages > 0
 
-    stage_params = p.pipeline_stage.clone()
-    if p.circular_repeat == 1:
-      pipeline_params = pipeline.LayerwiseShardablePipelined.HParams(
-          name=p.name,
-          num_stages=p.num_pipeline_stages,
+    stage_params = self.pipeline_stage.clone()
+    if self.circular_repeat == 1:
+      pipeline_params = pax_fiddle.Config(
+          pipeline.LayerwiseShardablePipelined,
+          name=self.name,
+          num_stages=self.num_pipeline_stages,
           single_stage_body=stage_params,
-          num_microbatches=p.num_pipeline_microbatches,
-          microbatch_size=p.pipeline_microbatch_size,
+          num_microbatches=self.num_pipeline_microbatches,
+          microbatch_size=self.pipeline_microbatch_size,
           unpack_summaries=True,
-          stream_io=p.stream_io,
-          pipeline_broadcast_inputs=p.pipeline_broadcast_inputs,
-          checkpoint_policy=p.checkpoint_policy)
+          stream_io=self.stream_io,
+          pipeline_broadcast_inputs=self.pipeline_broadcast_inputs,
+          checkpoint_policy=self.checkpoint_policy,
+      )
     else:
-      pipeline_params = pipeline.CircularLayerwiseShardablePipelined.HParams(
-          name=p.name,
-          num_stages=p.num_pipeline_stages,
-          circular_repeat=p.circular_repeat,
+      pipeline_params = pax_fiddle.Config(
+          pipeline.CircularLayerwiseShardablePipelined,
+          name=self.name,
+          num_stages=self.num_pipeline_stages,
+          circular_repeat=self.circular_repeat,
           single_stage_body=stage_params,
-          num_microbatches=p.num_pipeline_microbatches,
-          microbatch_size=p.pipeline_microbatch_size,
+          num_microbatches=self.num_pipeline_microbatches,
+          microbatch_size=self.pipeline_microbatch_size,
           unpack_summaries=True,
-          stream_io=p.stream_io,
-          pipeline_broadcast_inputs=p.pipeline_broadcast_inputs,
-          checkpoint_policy=p.checkpoint_policy)
+          stream_io=self.stream_io,
+          pipeline_broadcast_inputs=self.pipeline_broadcast_inputs,
+          checkpoint_policy=self.checkpoint_policy,
+      )
 
     pipeline_params.weight_split_dims_mapping.stages = (
-        p.weight_split_dims_mapping.stages)
+        self.weight_split_dims_mapping.stages
+    )
     self.create_child('pipeline', pipeline_params)
 
   def __call__(self,
@@ -2003,28 +1997,30 @@ class PipelinedTransformer(base_layer.BaseLayer):
     Returns:
       Output vector with shape [B, T, D].
     """
-    p = self.hparams
-    if p.pipeline_stage.cls == StackedTransformer:
-      xformer_layer_p = p.pipeline_stage.transformer_layer_params_tpl
+    if self.pipeline_stage.cls == StackedTransformer:
+      xformer_layer_p = self.pipeline_stage.transformer_layer_params_tpl
     else:
-      assert p.pipeline_stage.cls == StackedTransformerRepeated
-      xformer_layer_p = p.pipeline_stage.block.transformer_layer_params_tpl
+      assert self.pipeline_stage.cls == StackedTransformerRepeated
+      xformer_layer_p = self.pipeline_stage.block.transformer_layer_params_tpl
     bld_mapping = xformer_layer_p.tr_atten_tpl.activation_split_dims_mapping.bld
-    if not p.stream_io:
+    if not self.stream_io:
       # Annotate the inputs before the pipeline to prevent unexpected
       # propagation from earlier layers.
-      inputs = base_layer.maybe_shard(inputs, bld_mapping, p.mesh_axis_names)
+      inputs = base_layer.maybe_shard(inputs, bld_mapping, self.mesh_axis_names)
       if bld_mapping is not None:
         # Annotate other broadcast inputs.
-        paddings = base_layer.maybe_shard(paddings, bld_mapping[:-1],
-                                          p.mesh_axis_names)
+        paddings = base_layer.maybe_shard(
+            paddings, bld_mapping[:-1], self.mesh_axis_names
+        )
 
         # For cross inputs, we only specify the batch dim sharding.
         def _shard_batch_dim_only(x):
           return base_layer.maybe_shard(
-              x, [bld_mapping[0]] + [-1] * (x.ndim - 1),
-              p.mesh_axis_names,
-              unconstrained_dims=range(1, x.ndim))
+              x,
+              [bld_mapping[0]] + [-1] * (x.ndim - 1),
+              self.mesh_axis_names,
+              unconstrained_dims=range(1, x.ndim),
+          )
 
         if segment_mask is not None:
           segment_mask = _shard_batch_dim_only(segment_mask)
@@ -2036,8 +2032,9 @@ class PipelinedTransformer(base_layer.BaseLayer):
           cross_segment_mask = _shard_batch_dim_only(cross_segment_mask)
 
         if segment_pos is not None:
-          segment_pos = base_layer.maybe_shard(segment_pos, bld_mapping[:-1],
-                                               p.mesh_axis_names)
+          segment_pos = base_layer.maybe_shard(
+              segment_pos, bld_mapping[:-1], self.mesh_axis_names
+          )
     outputs = self.pipeline(
         inputs,
         paddings,
@@ -2053,13 +2050,17 @@ class PipelinedTransformer(base_layer.BaseLayer):
     # The second is to switch to other shardings for later layers;
     # e.g., repurpose pipeline stages cores to data parallelism for softmax.
 
-    if not p.stream_io:
+    if not self.stream_io:
       # Annotate the output to match input sharding.
-      outputs = base_layer.maybe_shard(outputs, bld_mapping, p.mesh_axis_names)
+      outputs = base_layer.maybe_shard(
+          outputs, bld_mapping, self.mesh_axis_names
+      )
     # Re-annotate the final output.
-    outputs = base_layer.maybe_shard(outputs,
-                                     p.activation_split_dims_mapping.final_out,
-                                     p.mesh_axis_names)
+    outputs = base_layer.maybe_shard(
+        outputs,
+        self.activation_split_dims_mapping.final_out,
+        self.mesh_axis_names,
+    )
     return outputs
 
   def init_states(self, *args, **kwargs) -> NestedMap:
@@ -2081,7 +2082,6 @@ class PipelineCompatibleStackedTransformerRepeated(StackedTransformerRepeated):
   """Repeated transformer for inference compatible with pipeline."""
 
   def setup(self) -> None:
-    p = self.hparams.clone()
-    p.repeat_layer_name = 'pipeline'
-    p.sublayer_name = 'body'
+    self.repeat_layer_name = 'pipeline'
+    self.sublayer_name = 'body'
     super().setup()

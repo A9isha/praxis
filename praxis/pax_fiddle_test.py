@@ -58,7 +58,7 @@ class Person:
 class Vehicle:
   wheel_tpl: pax_fiddle.Config[Wheel] = pax_fiddle.template_field(Wheel)
   num_wheels: int = 4
-  owner: Person = pax_fiddle.sub_field(Person)
+  owner: Person = pax_fiddle.instance_field(Person)
   wheels: Optional[List[Wheel]] = None  # Initialized by setup.
 
   def setup(self):
@@ -81,7 +81,7 @@ class ColoredVehicle(Vehicle):
 class Fleet:
   vehicle_tpl: pax_fiddle.Config[Vehicle] = pax_fiddle.template_field(Vehicle)
   num_vehicles: int = 1
-  manager: Person = pax_fiddle.sub_field(Person)
+  manager: Person = pax_fiddle.instance_field(Person)
   vehicles: Optional[List[Vehicle]] = None  # Initialized by setup.
 
   def setup(self):
@@ -443,7 +443,7 @@ class PaxConfigTest(testing.TestCase, parameterized.TestCase):
         target.copy_fields_from(source)
 
   def test_mesh_shape(self):
-    cfg = pax_fiddle.Config(base_layer.FiddleBaseLayer)
+    cfg = pax_fiddle.Config(base_layer.BaseLayer)
     self.assertIsNone(cfg.mesh_shape)
     cfg.mesh_axis_names = ["a", "b"]
     cfg.ici_mesh_shape = [1, 2]
@@ -460,7 +460,7 @@ class LayerA(nn.Module):
 
 
 class LayerB(nn.Module):
-  a: LayerA = pax_fiddle.sub_field(LayerA)
+  a: LayerA = pax_fiddle.instance_field(LayerA)
 
   def __call__(self):
     return self.a()
@@ -492,7 +492,7 @@ class LayerC(nn.Module):
     return 0
 
 
-class LayerD(base_layer.FiddleBaseLayer):
+class LayerD(base_layer.BaseLayer):
 
   def setup(self):
     self.create_variable(
@@ -545,53 +545,43 @@ class BuildTest(testing.TestCase, parameterized.TestCase):
 
 class LayerE(base_layer.BaseLayer):
 
-  class HParams(base_layer.BaseLayer.HParams):
-    tpl: pax_fiddle.Config[LayerD] = base_layer.sub_config_field(LayerD.HParams)
+  tpl: pax_fiddle.Config[LayerD] = base_layer.template_field(LayerD)
 
 
 class DaglishTest(testing.TestCase, parameterized.TestCase):
 
   def test_hparams_with_fiddle_subconfig(self):
-    config = LayerE.HParams()
+    config = pax_fiddle.Config(LayerE)
 
     all_sub_values = {
         daglish.path_str(path): value
         for value, path in pax_fiddle.iterate(config)
     }
     self.assertDictEqual(
-        all_sub_values, {
-            "":
-                config,
-            ".activation_split_dims_mapping":
-                base_layer.BaseLayer.ActivationShardingHParams(out=None),
-            ".cls":
-                LayerE,
-            ".dtype":
-                jnp.float32,
-            ".fprop_dtype":
-                None,
-            ".name":
-                "",
-            ".params_init":
-                base_layer.WeightInit(method="xavier", scale=1.000001),
-            ".params_init.method":
-                "xavier",
-            ".params_init.scale":
-                1.000001,
-            ".tpl":
-                config.tpl,
-            ".tpl.activation_split_dims_mapping":
-                config.tpl.activation_split_dims_mapping,
-            ".tpl.params_init":
-                config.tpl.params_init,
-            ".tpl.weight_split_dims_mapping":
-                config.tpl.weight_split_dims_mapping,
-            ".weight_split_dims_mapping":
-                base_layer.BaseLayer.WeightShardingHParams(wt=None)
-        })
+        all_sub_values,
+        {
+            "": config,
+            ".activation_split_dims_mapping": pax_fiddle.Config(
+                base_layer.BaseLayer.ActivationSharding, out=None
+            ),
+            ".params_init": pax_fiddle.Config(
+                base_layer.WeightInit, method="xavier", scale=1.000001
+            ),
+            ".params_init.method": "xavier",
+            ".params_init.scale": 1.000001,
+            ".tpl": config.tpl,
+            ".tpl.activation_split_dims_mapping": config.tpl.activation_split_dims_mapping,
+            ".tpl.params_init": config.tpl.params_init,
+            ".tpl.weight_split_dims_mapping": config.tpl.weight_split_dims_mapping,
+            ".weight_split_dims_mapping": pax_fiddle.Config(
+                base_layer.BaseLayer.WeightSharding, wt=None
+            ),
+        },
+    )
 
   def test_non_memoized_iterate(self):
-    config = LayerE.HParams()
+    config = pax_fiddle.Config(LayerE)
+    fdl.materialize_defaults(config)
     paths = [
         daglish.path_str(path)
         for value, path in pax_fiddle.iterate(config, memoized=False)
@@ -614,7 +604,8 @@ class DaglishTest(testing.TestCase, parameterized.TestCase):
   @parameterized.parameters(pax_fiddle.BasicTraversal,
                             pax_fiddle.MemoizedTraversal)
   def test_replacement(self, traversal_cls):
-    config = LayerE.HParams()
+    config = pax_fiddle.Config(LayerE)
+    fdl.materialize_defaults(config)
 
     def traverse(value, state: daglish.State):
       if value == jnp.float32:

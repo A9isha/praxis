@@ -16,6 +16,7 @@
 """Tests for Praxis vit model."""
 
 from typing import Tuple
+from praxis import pax_fiddle
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -26,6 +27,7 @@ from praxis import py_utils
 from praxis import test_utils
 from praxis.layers import activations
 from praxis.layers import embedding_softmax
+from praxis.layers import poolings
 from praxis.layers import transformers
 from praxis.layers import vits
 
@@ -52,27 +54,31 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
     )
 
   def _vit_entry_layers(self, exp_params):
-    num_patches = np.prod(exp_params.pos_embed_shapes)
+    num_patches = np.prod(exp_params.pos_emb_shapes)
     num_patches += exp_params.prepend_cls_tokens
     num_patches += exp_params.append_cls_tokens
-    p_entry = vits.VitEntryLayers.HParams(
+    p_entry = pax_fiddle.Config(
+        vits.VitEntryLayers,
         name='entry',
-        pos_embed_shapes=exp_params.pos_embed_shapes,
+        pos_emb_shapes=exp_params.pos_emb_shapes,
         patch_size=exp_params.patch_size,
         input_dims=exp_params.patch_size**2 * 3,
         output_dims=exp_params.hidden_dim,
         pos_emb_dropout_prob=0.1,
-        pos_emb_tpl=embedding_softmax.TrainablePositionalEmbedding.HParams(
+        pos_emb_tpl=pax_fiddle.Config(
+            embedding_softmax.TrainablePositionalEmbedding,
             max_seq_length=num_patches,
             embedding_dims=exp_params.hidden_dim,
-            params_init=base_layer.WeightInit.Gaussian(scale=0.02)),
+            params_init=base_layer.WeightInit.Gaussian(scale=0.02),
+        ),
         prepend_cls_tokens=exp_params.prepend_cls_tokens,
         append_cls_tokens=exp_params.append_cls_tokens,
     )
     return p_entry
 
   def _vit_transformer_layers(self, exp_params):
-    p_stacked_tfm = transformers.StackedTransformer.HParams(
+    p_stacked_tfm = pax_fiddle.Config(
+        transformers.StackedTransformer,
         model_dims=exp_params.hidden_dim,
         hidden_dims=exp_params.hidden_dim * 4,
         num_heads=exp_params.num_heads,
@@ -86,19 +92,27 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
 
     p_tfm = p_stacked_tfm.transformer_layer_params_tpl
     p_tfm.norm_policy = 'pre'
-    p_tfm.tr_fflayer_tpl.activation_tpl = activations.GELU.HParams()
+    p_tfm.tr_fflayer_tpl.activation_tpl = pax_fiddle.Config(activations.GELU)
     p_tfm.tr_atten_tpl.atten_logit_cap = 0.0
     p_tfm.tr_atten_tpl.internal_enable_per_dim_scale = False
 
     return p_stacked_tfm
 
   def _vit_exit_layers(self, exp_params):
-    p_exit = vits.VitExitLayers.HParams(
+    p_exit = pax_fiddle.Config(
+        vits.VitExitLayers,
         name='exit',
         hidden_dim=exp_params.hidden_dim,
         output_dim=exp_params.hidden_dim,
         pooled=exp_params.pooled,
-        output_dropout_prob=0.1)
+        pooling_tpl=pax_fiddle.Config(
+            poolings.GlobalPooling,
+            pooling_type='MAX',
+            pooling_dims=[1],
+            keepdims=False,
+        ),
+        output_dropout_prob=0.1,
+    )
     return p_exit
 
   @parameterized.named_parameters(
@@ -106,9 +120,9 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
       ('square_image_square_embeddings_interp', (64, 64, 3), (8, 8)),
       ('rec_image_rec_embeddings_interp', (16, 24, 3), (2, 3)),
       ('sequence_input', (16, 4**2 * 3), (4, 4)))
-  def test_vit_entry_layers(self, input_shapes, pos_embed_shapes):
+  def test_vit_entry_layers(self, input_shapes, pos_emb_shapes):
     exp_params = self._exp_params()
-    exp_params.pos_embed_shapes = pos_embed_shapes
+    exp_params.pos_emb_shapes = pos_emb_shapes
     p_entry = self._vit_entry_layers(exp_params)
     entry = instantiate(p_entry)
 
@@ -195,7 +209,7 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
   def test_vit(self, pooled: bool, image_sizes: Tuple[int, int],
                prepend_cls_tokens: int, append_cls_tokens: int):
     exp_params = self._exp_params()
-    exp_params.pos_embed_shapes = (3, 5)
+    exp_params.pos_emb_shapes = (3, 5)
     exp_params.prepend_cls_tokens = prepend_cls_tokens
     exp_params.append_cls_tokens = append_cls_tokens
     exp_params.pooled = pooled
@@ -204,11 +218,12 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
     transformer_p = self._vit_transformer_layers(exp_params)
     exit_p = self._vit_exit_layers(exp_params)
 
-    p_vit = vits.VisionTransformer.HParams().set(
+    p_vit = pax_fiddle.Config(vits.VisionTransformer).set(
         name='vit',
         entry_layers_tpl=entry_p,
         transformer_layers_tpl=transformer_p,
-        exit_layers_tpl=exit_p)
+        exit_layers_tpl=exit_p,
+    )
 
     vit_model = instantiate(p_vit)
 

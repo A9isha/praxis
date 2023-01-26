@@ -16,18 +16,19 @@
 """Unit tests for sample_decode."""
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import flax.linen as nn
 import jax
 from jax import numpy as jnp
 import numpy as np
 from praxis import base_layer
 from praxis import base_model
+from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import sample_decode
 from praxis import test_utils
 
 NestedMap = py_utils.NestedMap
-BaseHParams = base_layer.BaseLayer.HParams
 WeightHPrams = base_layer.WeightHParams
 instantiate = base_layer.instantiate
 
@@ -36,20 +37,54 @@ DECODE_CACHE = base_layer.DECODE_CACHE
 SUMMARIES = base_layer.SUMMARIES
 
 
-class TestModel(base_model.BaseModel):
+class TestNextTokenSampler(sample_decode.BaseNextTokenSampler):
 
-  class HParams(base_model.BaseModel.HParams):
-    vocab_size: int = 0
-    num_samples: int = 0
-    seq_len: int = 0
-    batch_size: int = 0
+  def __call__(
+      self,
+      mdl,
+      logits,
+      temperature,
+      decode_loop_state,
+      per_example_top_p,
+      per_example_top_k,
+      gumbel_prng_key,
+  ):
+    del (
+        mdl,
+        logits,
+        temperature,
+        decode_loop_state,
+        per_example_top_p,
+        gumbel_prng_key,
+    )
+    return jnp.array([1234, 2345])
+
+
+class TestModel(base_model.BaseModel):
+  use_dummy_next_token_sampler: bool = True
+  vocab_size: int = 0
+  num_samples: int = 0
+  seq_len: int = 0
+  batch_size: int = 0
 
   def setup(self) -> None:
-    p = self.hparams
     super().setup()
     logits_wp = base_layer.WeightHParams(
-        shape=[p.seq_len, p.batch_size * p.num_samples, p.vocab_size])
+        shape=[
+            self.seq_len,
+            self.batch_size * self.num_samples,
+            self.vocab_size,
+        ]
+    )
     self.create_variable('logits', logits_wp)
+    if self.use_dummy_next_token_sampler:
+      self.next_token_sampler = base_layer.instantiate(
+          TestNextTokenSampler.HParams()
+      )
+    else:
+      self.next_token_sampler = base_layer.instantiate(
+          sample_decode.DefaultNextTokenSampler.HParams(top_k=0, top_p=1.0)
+      )
 
   def __call__(self, *args, **kwargs):
     # A dummy __call__ function
@@ -57,11 +92,10 @@ class TestModel(base_model.BaseModel):
 
   # do something here
   def extend_step(self, ids, segment_pos):
-    p = self.hparams
-    assert segment_pos.shape == (p.batch_size *
-                                 p.num_samples,), (segment_pos.shape,
-                                                   (p.batch_size *
-                                                    p.num_samples,))
+    assert segment_pos.shape == (self.batch_size * self.num_samples,), (
+        segment_pos.shape,
+        (self.batch_size * self.num_samples,),
+    )
     time_step = segment_pos[0] + 1
     logits_at_t = self.theta.logits[time_step, :, :]
     self.add_summary('logits', logits_at_t)
@@ -77,38 +111,7 @@ class SampleDecodeHelperTest(test_utils.TestCase):
         sample_decode.split_batch_dim(x, batch_dim=0, num_samples=2),
         np.array([[[1, 2], [1, 2]], [[3, 4], [3, 4]]], dtype=np.int32))
 
-  def test_sample_from_topk_with_gumbel_noise(self):
-    logits = jnp.array(
-        [[0, 0, 1, 1, 0], [1, 0, 0, 0, 1], [0, 1, 1, 0, 0], [1, 1, 0, 0, 0]],
-        dtype=jnp.float32)
-    noise = jnp.array([[0.5, 0], [-0.5, 0], [-0.5, -1], [1, 0.5]],
-                      dtype=jnp.float32)
-    # logits + noise =
-    # [[0, 0, 1.5, 1, 0], # argmax: 2
-    #  [0.5, 0, 0, 0, 1]  # argmax: 4
-    #  [0, 0.5, 0, 0, 0], # argmax: 1
-    #  [2, 1.5, 0, 0, 0]] # argmax: 0
-    new_ids = sample_decode.sample_from_topk_with_gumbel_noise(
-        logits, noise, temperature=1.0, topk=2)
-    self.assertArraysEqual(new_ids, np.array([2, 4, 1, 0], dtype=np.int32))
-
-  def test_sample_from_topk_with_gumbel_noise_dyn_temp(self):
-    logits = jnp.array([[[0, 0, 1, 1, 0], [1, 0, 0, 0, 1]],
-                        [[0, 1, 1, 0, 0], [1, 1, 0, 0, 0]]],
-                       dtype=jnp.float32)
-    noise = jnp.array([[[0.5, 0], [-0.5, 0]], [[-0.5, -1], [1, 0.5]]],
-                      dtype=jnp.float32)
-    temperature = jnp.array([[0.1], [0.2]], dtype=jnp.float32)
-    new_ids = sample_decode.sample_from_topk_with_gumbel_noise(
-        logits, noise, temperature=temperature, topk=2)
-    # logits + noise =
-    # [[[0, 0, 1.5, 1, 0], # argmax: 2
-    #  [0.5, 0, 0, 0, 1]]  # argmax: 4
-    #  [[0, 0.5, 0, 0, 0], # argmax: 1
-    #  [2, 1.5, 0, 0, 0]]] # argmax: 0
-    self.assertArraysEqual(new_ids, np.array([[2, 4], [1, 0]], dtype=np.int32))
-
-  def test_sample_from_topk(self):
+  def test_sample_from_top_k(self):
     logits = jnp.array(
         [
             [0, 0, 1, 0, 0],  # argmax: 2
@@ -117,12 +120,91 @@ class SampleDecodeHelperTest(test_utils.TestCase):
             [1, 0, 0, 0, 0],  # argmax: 0
         ],
         dtype=jnp.float32)
-    new_ids = sample_decode.sample_from_topk(
-        logits, jax.random.PRNGKey(seed=123), temperature=1.0, topk=2)
+    new_ids = sample_decode.sample_from_top_k_and_top_p(
+        logits, jax.random.PRNGKey(seed=123), temperature=1.0, top_k=2
+    )
     # gumbel noise is relatively smaller compared to the logits value.
     self.assertArraysEqual(new_ids, np.array([2, 0, 1, 0], dtype=np.int32))
 
-  def test_sample_from_topk_dyn_temp(self):
+  def test_sample_from_top_k_and_top_p_scalar(self):
+    logits = jnp.array(
+        [
+            [0.1, 0.7, 0.2, 0, 0],
+            [0.3, 0.1, 0, 0.2, 0.5],
+            [0.2, 0.6, 0.1, 0, 0.1],
+            [0.5, 0, 0.5, 0, 0],
+        ],
+        dtype=jnp.float32,
+    )
+    new_ids = sample_decode.sample_from_top_k_and_top_p(
+        logits,
+        jax.random.PRNGKey(seed=123),
+        temperature=1.0,
+        top_k=2,
+        top_p=0.5,
+    )
+    # gumbel noise is relatively smaller compared to the logits value.
+    self.assertArraysEqual(new_ids, np.array([1, 4, 1, 0], dtype=np.int32))
+
+  def test_sample_from_top_k_and_top_p_scalar_false_fn(self):
+    logits = jnp.array(
+        [
+            [0.1, 0.7, 0.2, 0, 0],
+            [0.3, 0.1, 0, 0.2, 0.5],
+            [0.2, 0.6, 0.1, 0, 0.1],
+            [0.5, 0, 0.5, 0, 0],
+        ],
+        dtype=jnp.float32,
+    )
+    new_ids = sample_decode.sample_from_top_k_and_top_p(
+        logits,
+        jax.random.PRNGKey(seed=123),
+        temperature=1.0,
+        top_k=2,
+        top_p=1.0,
+    )
+    # gumbel noise is relatively smaller compared to the logits value.
+    self.assertArraysEqual(new_ids, np.array([1, 4, 1, 0], dtype=np.int32))
+
+  def test_sample_from_top_k_and_top_p_tensor(self):
+    logits = jnp.array(
+        [
+            [0.1, 0.7, 0.2, 0, 0],
+            [0.2, 0.2, 0.2, 0.2, 0.2],
+        ],
+        dtype=jnp.float32,
+    )
+    new_ids = sample_decode.sample_from_top_k_and_top_p(
+        logits,
+        jax.random.PRNGKey(seed=123),
+        temperature=1.0,
+        top_k=4,
+        top_p=jnp.array([[0.75], [0.3]], dtype=jnp.float32),
+    )
+    # gumbel noise is relatively smaller compared to the logits value.
+    self.assertArraysEqual(new_ids, np.array([1, 0], dtype=np.int32))
+
+  def test_sample_from_top_k_and_top_p_tensor_false_fn(self):
+    logits = jnp.array(
+        [
+            [0.1, 0.7, 0.2, 0, 0],
+            [0.3, 0.1, 0, 0.2, 0.5],
+            [0.2, 0.6, 0.1, 0, 0.1],
+            [0.5, 0, 0.5, 0, 0],
+        ],
+        dtype=jnp.float32,
+    )
+    new_ids = sample_decode.sample_from_top_k_and_top_p(
+        logits,
+        jax.random.PRNGKey(seed=123),
+        temperature=1.0,
+        top_k=2,
+        top_p=jnp.array([[1.0], [1.0], [1.0], [1.0]], dtype=jnp.float32),
+    )
+    # gumbel noise is relatively smaller compared to the logits value.
+    self.assertArraysEqual(new_ids, np.array([1, 4, 1, 0], dtype=np.int32))
+
+  def test_sample_from_top_k_dyn_temp(self):
     logits = jnp.array(
         [
             [
@@ -137,20 +219,22 @@ class SampleDecodeHelperTest(test_utils.TestCase):
         dtype=jnp.float32)
 
     temperature = jnp.array([[0.1], [0.2]], dtype=jnp.float32)
-    new_ids = sample_decode.sample_from_topk(
-        logits, jax.random.PRNGKey(seed=123), temperature=temperature, topk=2)
+    new_ids = sample_decode.sample_from_top_k_and_top_p(
+        logits, jax.random.PRNGKey(seed=123), temperature=temperature, top_k=2
+    )
     # gumbel noise is relatively smaller compared to the logits value.
     self.assertArraysEqual(new_ids, np.array([[2, 0], [1, 0]], dtype=np.int32))
 
-  def test_sample_from_topk_distribution(self):
+  def test_sample_from_top_k_distribution(self):
     logits = jnp.array([
         [0, 0.25, 0.2, 0.15, 0.4],
     ], dtype=jnp.float32)
     count = [0] * 5
 
     for i in range(100):
-      new_ids = sample_decode.sample_from_topk(
-          logits, jax.random.PRNGKey(seed=i), temperature=1.0, topk=4)
+      new_ids = sample_decode.sample_from_top_k_and_top_p(
+          logits, jax.random.PRNGKey(seed=i), temperature=1.0, top_k=4
+      )
       count[new_ids[0]] += 1
 
     # Top4 value won't choose token 0.
@@ -161,6 +245,14 @@ class SampleDecodeHelperTest(test_utils.TestCase):
     self.assertGreaterEqual(count[3], 10)
     # Token #4 should be chosen more than 25%.
     self.assertGreaterEqual(count[4], 25)
+
+  def test_get_argmax_ids(self):
+    top_k_argmax_ids = jnp.array([2, 1], dtype=jnp.int32)
+    top_k_indices = jnp.array(
+        [[12, 200, 300, 9], [500, 608, 9000, 7]], dtype=jnp.int32
+    )
+    argmax_ids = sample_decode._get_argmax_ids(top_k_argmax_ids, top_k_indices)
+    self.assertArraysEqual(argmax_ids, jnp.array([300, 608], dtype=jnp.int32))
 
   def test_reorder_with_indices(self):
     indices = jnp.array([[0, 2, 1], [2, 0, 1]], dtype=jnp.int32)
@@ -251,22 +343,50 @@ class SampleDecodeHelperTest(test_utils.TestCase):
                   dtype=jnp.int32))
 
   def test_top_p_mask_logits(self):
-    logits = jnp.array([[1.0, 1.0, 0.5, -1e6]])
+    logits = jnp.array([[1.0, 1.0, 1.0, -1e6]])
     masked = sample_decode.top_p_mask_logits(logits, p=0.99)
     self.assertAllClose(logits[:, :-1], masked[:, :-1])
     self.assertLess(masked[0, -1], 1e-10)
 
-  def test_sample_decode(self):
+  def test_epsilon_mask_logits(self):
+    logits = jnp.array([[1.0, 1.0, 0.5, -1e6]])
+    masked = sample_decode.epsilon_mask_logits(logits, epsilon=0.1)
+    self.assertAllClose(logits[:, :-1], masked[:, :-1])
+    self.assertLess(masked[0, -1], 1e-10)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='use_dummy_next_token_sampler',
+          use_dummy_next_token_sampler=True,
+          use_gumbel_prng_key=False,  # doesn't matter
+      ),
+      dict(
+          testcase_name='without_gumbel_prng_key',
+          use_dummy_next_token_sampler=False,
+          use_gumbel_prng_key=False,
+      ),
+      dict(
+          testcase_name='with_gumbel_prng_key',
+          use_dummy_next_token_sampler=False,
+          use_gumbel_prng_key=True,
+      ),
+  )
+  def test_sample_decode(
+      self, use_dummy_next_token_sampler, use_gumbel_prng_key
+  ):
     batch_size = 1
     num_samples = 2
     seq_len = 3
     vocab_size = 4
-    model_p = TestModel.HParams(
+    model_p = pax_fiddle.Config(
+        TestModel,
         name='test_model',
         batch_size=batch_size,
         num_samples=num_samples,
         seq_len=seq_len,
-        vocab_size=vocab_size)
+        vocab_size=vocab_size,
+        use_dummy_next_token_sampler=use_dummy_next_token_sampler,
+    )
 
     def extend_step_fn(mdl, ids, segment_pos):
       logits = mdl.extend_step(ids, segment_pos=segment_pos)
@@ -285,22 +405,29 @@ class SampleDecodeHelperTest(test_utils.TestCase):
     input_paddings = jnp.zeros([batch_size, seq_len], dtype=jnp.float32)
 
     def decode_fn(model, input_ids, input_paddings):
+      gumbel_prng_key = None
+      if use_gumbel_prng_key:
+        gumbel_prng_key = jax.vmap(jax.random.PRNGKey)(
+            jnp.arange(1002, 1002 + batch_size)
+        )
       return sample_decode.sample_decode(
           model,
           extend_step_fn,
           transform_decode_state_fn,
           None,
+          model.next_token_sampler,
           input_ids,
           input_paddings,
           prefix_lengths=jnp.zeros([batch_size], dtype=jnp.int32),
           seq_len=seq_len,
           num_samples=num_samples,
-          k=0,
+          gumbel_prng_key=gumbel_prng_key,
           max_prefix_len=0,
           max_decode_steps=seq_len,
           fprop_for_prefix=True,
           # Call the scan loop.
-          early_exit=False)
+          early_exit=False,
+      )
 
     mutables = [SUMMARIES, DECODE_CACHE]
     rngs = {'random': jax.random.PRNGKey(9382)}
@@ -310,11 +437,21 @@ class SampleDecodeHelperTest(test_utils.TestCase):
         decode_fn, model, mutable=mutables)(
             init_vars, input_ids, input_paddings, rngs=rngs)
     logits_summary = updated_vars['summaries']['logits_scalar']
+    new_ids_summary = updated_vars['summaries']['new_ids_scalar']
     time_step_summary = updated_vars['summaries']['time_step_scalar']
     print('logits_var', logits_var)
     print('logits_summary', logits_summary)
     print('time_step_summary', time_step_summary)
     self.assertAllClose(logits_var, logits_summary)
+    # from IPython import embed; embed()
+    if use_dummy_next_token_sampler:
+      self.assertAllClose(
+          new_ids_summary, jnp.tile(jnp.array([1234, 2345]), [3, 1])
+      )
+    elif use_gumbel_prng_key:
+      self.assertAllClose(new_ids_summary, jnp.array([[1, 2], [3, 0], [0, 0]]))
+    else:
+      self.assertAllClose(new_ids_summary, jnp.array([[3, 0], [2, 1], [0, 1]]))
 
 
 if __name__ == '__main__':
